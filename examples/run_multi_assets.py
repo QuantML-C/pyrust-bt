@@ -57,11 +57,11 @@ class MultiAssetSMAStrategy(Strategy):
 
 def main() -> None:
     cfg = BacktestConfig(
-        start="2020-01-02 09:30",
-        end="2020-01-02 09:40",
+        start="2022-01-01",
+        end="2022-07-31",
         cash=10000.0,
-        commission_rate=0.0005,
-        slippage_bps=2.0,
+        commission_rate=0.,
+        slippage_bps=0.,
         batch_size=1000,
     )
     engine = BacktestEngine(cfg)

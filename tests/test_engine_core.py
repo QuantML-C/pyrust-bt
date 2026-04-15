@@ -106,11 +106,21 @@ class EngineCoreTests(unittest.TestCase):
         result = self.make_engine().run(BuyOnceStrategy(), make_bars(symbol="SINGLE"))
         trade = result["trades"][0]
 
-        for key in ("order_id", "side", "price", "size", "symbol", "datetime", "commission"):
+        for key in (
+            "order_id",
+            "side",
+            "price",
+            "size",
+            "symbol",
+            "datetime",
+            "commission",
+            "realized_pnl",
+        ):
             self.assertIn(key, trade)
         self.assertEqual(trade["symbol"], "SINGLE")
         self.assertEqual(trade["datetime"], "2024-01-01 09:30:00")
         self.assertAlmostEqual(trade["commission"], 0.01)
+        self.assertAlmostEqual(trade["realized_pnl"], 0.0)
 
     def test_multi_asset_trade_records_include_symbol(self):
         class MultiBuyStrategy(Strategy):
@@ -137,6 +147,218 @@ class EngineCoreTests(unittest.TestCase):
         for trade in result["trades"]:
             self.assertIn("datetime", trade)
             self.assertIn("commission", trade)
+            self.assertIn("realized_pnl", trade)
+
+    def test_config_start_end_filter_single_asset_bars(self):
+        class NoopStrategy(Strategy):
+            def next(self, bar):
+                return None
+
+        cfg = BacktestConfig(
+            start="2024-01-01 09:31:00",
+            end="2024-01-01 09:31:00",
+            cash=1000.0,
+            commission_rate=0.0,
+            slippage_bps=0.0,
+        )
+        result = BacktestEngine(cfg).run(NoopStrategy(), make_bars())
+
+        self.assertEqual(len(result["equity_curve"]), 1)
+        self.assertEqual(result["equity_curve"][0]["datetime"], "2024-01-01 09:31:00")
+
+    def test_config_date_only_end_includes_entire_day(self):
+        class NoopStrategy(Strategy):
+            def next(self, bar):
+                return None
+
+        bars = [
+            {
+                "datetime": "2024-01-01 15:00:00",
+                "open": 10.0,
+                "high": 10.0,
+                "low": 10.0,
+                "close": 10.0,
+                "volume": 1000.0,
+                "symbol": "TEST",
+            },
+            {
+                "datetime": "2024-01-02 09:30:00",
+                "open": 11.0,
+                "high": 11.0,
+                "low": 11.0,
+                "close": 11.0,
+                "volume": 1000.0,
+                "symbol": "TEST",
+            },
+        ]
+        cfg = BacktestConfig(
+            start="2024-01-01",
+            end="2024-01-01",
+            cash=1000.0,
+            commission_rate=0.0,
+            slippage_bps=0.0,
+        )
+        result = BacktestEngine(cfg).run(NoopStrategy(), bars)
+
+        self.assertEqual(len(result["equity_curve"]), 1)
+        self.assertEqual(result["equity_curve"][0]["datetime"], "2024-01-01 15:00:00")
+
+    def test_config_start_end_filter_multi_asset_timeline(self):
+        class NoopStrategy(Strategy):
+            def next_multi(self, update_slice, ctx):
+                return None
+
+        feeds = {
+            "AAA": [
+                {
+                    "datetime": "2024-01-01 09:30:00",
+                    "open": 10.0,
+                    "high": 10.0,
+                    "low": 10.0,
+                    "close": 10.0,
+                    "volume": 1000.0,
+                    "symbol": "AAA",
+                },
+                {
+                    "datetime": "2024-01-02 09:30:00",
+                    "open": 11.0,
+                    "high": 11.0,
+                    "low": 11.0,
+                    "close": 11.0,
+                    "volume": 1000.0,
+                    "symbol": "AAA",
+                },
+            ],
+            "BBB": [
+                {
+                    "datetime": "2024-01-01 09:30:00",
+                    "open": 20.0,
+                    "high": 20.0,
+                    "low": 20.0,
+                    "close": 20.0,
+                    "volume": 1000.0,
+                    "symbol": "BBB",
+                },
+                {
+                    "datetime": "2024-01-02 09:30:00",
+                    "open": 21.0,
+                    "high": 21.0,
+                    "low": 21.0,
+                    "close": 21.0,
+                    "volume": 1000.0,
+                    "symbol": "BBB",
+                },
+            ],
+        }
+        cfg = BacktestConfig(
+            start="2024-01-02",
+            end="2024-01-02",
+            cash=1000.0,
+            commission_rate=0.0,
+            slippage_bps=0.0,
+        )
+        result = BacktestEngine(cfg).run_multi(NoopStrategy(), feeds)
+
+        self.assertEqual(len(result["equity_curve"]), 1)
+        self.assertEqual(result["equity_curve"][0]["datetime"], "2024-01-02 09:30:00")
+
+    def test_annualized_return_uses_total_return_and_elapsed_time(self):
+        class BuyOnceStrategy(Strategy):
+            def __init__(self):
+                self.done = False
+
+            def next(self, bar):
+                if self.done:
+                    return None
+                self.done = True
+                return {"action": "BUY", "type": "market", "size": 100.0}
+
+        bars = [
+            {
+                "datetime": "2024-01-01",
+                "open": 10.0,
+                "high": 10.0,
+                "low": 10.0,
+                "close": 10.0,
+                "volume": 1000.0,
+                "symbol": "TEST",
+            },
+            {
+                "datetime": "2024-07-01",
+                "open": 14.0,
+                "high": 14.0,
+                "low": 14.0,
+                "close": 14.0,
+                "volume": 1000.0,
+                "symbol": "TEST",
+            },
+        ]
+        cfg = BacktestConfig(
+            start="2024-01-01",
+            end="2024-07-01",
+            cash=1000.0,
+            commission_rate=0.0,
+            slippage_bps=0.0,
+        )
+        result = BacktestEngine(cfg).run(BuyOnceStrategy(), bars)
+        expected = (1400.0 / 1000.0) ** (365.25 / 182.0) - 1.0
+
+        self.assertAlmostEqual(result["stats"]["total_return"], 0.4)
+        self.assertAlmostEqual(result["stats"]["annualized_return"], expected)
+        self.assertGreater(result["stats"]["annualized_return"], 0.0)
+
+    def test_stats_total_pnl_uses_equity_and_trade_stats_use_realized_pnl(self):
+        class RoundTripStrategy(Strategy):
+            def __init__(self):
+                self.index = 0
+
+            def next(self, bar):
+                self.index += 1
+                if self.index == 1:
+                    return {"action": "BUY", "type": "market", "size": 10.0}
+                if self.index == 2:
+                    return {"action": "SELL", "type": "market", "size": 10.0}
+                return None
+
+        bars = [
+            {
+                "datetime": "2024-01-01",
+                "open": 10.0,
+                "high": 10.0,
+                "low": 10.0,
+                "close": 10.0,
+                "volume": 1000.0,
+                "symbol": "TEST",
+            },
+            {
+                "datetime": "2024-01-02",
+                "open": 15.0,
+                "high": 15.0,
+                "low": 15.0,
+                "close": 15.0,
+                "volume": 1000.0,
+                "symbol": "TEST",
+            },
+        ]
+        cfg = BacktestConfig(
+            start="2024-01-01",
+            end="2024-01-02",
+            cash=1000.0,
+            commission_rate=0.0,
+            slippage_bps=0.0,
+        )
+        result = BacktestEngine(cfg).run(RoundTripStrategy(), bars)
+        stats = result["stats"]
+
+        self.assertAlmostEqual(stats["total_pnl"], 50.0)
+        self.assertAlmostEqual(stats["realized_pnl"], 50.0)
+        self.assertAlmostEqual(stats["unrealized_pnl"], 0.0)
+        self.assertEqual(stats["total_trades"], 2)
+        self.assertEqual(stats["closed_trades"], 1)
+        self.assertEqual(stats["winning_trades"], 1)
+        self.assertEqual(stats["losing_trades"], 0)
+        self.assertAlmostEqual(stats["win_rate"], 1.0)
+        self.assertAlmostEqual(result["trades"][1]["realized_pnl"], 50.0)
 
 
 if __name__ == "__main__":

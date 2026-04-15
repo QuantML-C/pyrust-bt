@@ -60,7 +60,7 @@ def main() -> None:
     bars = load_csv_to_bars(data_path, symbol="SAMPLE")
 
     # Run
-    strategy = DummySMAStrategy(window=5, size=1.0)
+    strategy = DummySMAStrategy(window=60, size=1.0)
     result = engine.run(strategy, bars)
 
     # Format output for readability

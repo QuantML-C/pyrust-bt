@@ -1,3 +1,5 @@
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList};
 use rayon::prelude::*;
@@ -60,6 +62,133 @@ impl BacktestConfig {
     }
 }
 
+#[derive(Clone, Debug)]
+struct DateRange {
+    start: Option<NaiveDateTime>,
+    end: Option<NaiveDateTime>,
+}
+
+impl DateRange {
+    fn from_config(cfg: &BacktestConfig) -> PyResult<Self> {
+        Ok(Self {
+            start: parse_config_datetime(&cfg.start, false, "start")?,
+            end: parse_config_datetime(&cfg.end, true, "end")?,
+        })
+    }
+
+    fn is_active(&self) -> bool {
+        self.start.is_some() || self.end.is_some()
+    }
+
+    fn contains_bar(&self, bar: &BarData) -> PyResult<bool> {
+        if !self.is_active() {
+            return Ok(true);
+        }
+
+        let dt_text = bar.datetime.as_deref().ok_or_else(|| {
+            PyValueError::new_err("BacktestConfig start/end requires bar datetime values")
+        })?;
+        let dt = parse_datetime_value(dt_text, false).ok_or_else(|| {
+            PyValueError::new_err(format!("invalid bar datetime value: {dt_text}"))
+        })?;
+
+        if let Some(start) = self.start {
+            if dt < start {
+                return Ok(false);
+            }
+        }
+        if let Some(end) = self.end {
+            if dt > end {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+fn parse_config_datetime(
+    value: &str,
+    date_only_is_end: bool,
+    field_name: &str,
+) -> PyResult<Option<NaiveDateTime>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    parse_datetime_value(trimmed, date_only_is_end)
+        .map(Some)
+        .ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "invalid BacktestConfig {field_name} datetime value: {trimmed}"
+            ))
+        })
+}
+
+fn parse_datetime_value(value: &str, date_only_is_end: bool) -> Option<NaiveDateTime> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+        return Some(dt.naive_utc());
+    }
+
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+    ] {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, fmt) {
+            return Some(dt);
+        }
+    }
+
+    if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        let time = if date_only_is_end {
+            NaiveTime::from_hms_nano_opt(23, 59, 59, 999_999_999)?
+        } else {
+            NaiveTime::from_hms_opt(0, 0, 0)?
+        };
+        return Some(date.and_time(time));
+    }
+
+    None
+}
+
+fn filter_bars_by_date_range(
+    bars_data: Vec<BarData>,
+    date_range: &DateRange,
+) -> PyResult<Vec<BarData>> {
+    if !date_range.is_active() {
+        return Ok(bars_data);
+    }
+
+    let mut filtered = Vec::with_capacity(bars_data.len());
+    for bar in bars_data {
+        if date_range.contains_bar(&bar)? {
+            filtered.push(bar);
+        }
+    }
+    Ok(filtered)
+}
+
+fn equity_curve_elapsed_years(equity_curve: &[(Option<String>, f64)]) -> Option<f64> {
+    let start_text = equity_curve.first()?.0.as_deref()?;
+    let end_text = equity_curve.last()?.0.as_deref()?;
+    let start = parse_datetime_value(start_text, false)?;
+    let end = parse_datetime_value(end_text, false)?;
+    let seconds = (end - start).num_seconds();
+    if seconds <= 0 {
+        return None;
+    }
+    Some(seconds as f64 / (365.25 * 24.0 * 60.0 * 60.0))
+}
+
 #[derive(Copy, Clone, Debug, PartialEq)]
 enum OrderSide {
     Buy,
@@ -92,6 +221,7 @@ struct TradeRecord {
     size: f64,
     datetime: Option<String>,
     commission: f64,
+    realized_pnl: f64,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -290,10 +420,11 @@ impl BacktestEngine {
         data: &'py PyAny,
     ) -> PyResult<PyObject> {
         let bars: &PyList = data.downcast()?;
-        let n_bars = bars.len();
 
         // 预提取所有bar数据到Rust结构中
-        let bars_data = extract_bars_data(bars)?;
+        let date_range = DateRange::from_config(&self.cfg)?;
+        let bars_data = filter_bars_by_date_range(extract_bars_data(bars)?, &date_range)?;
+        let n_bars = bars_data.len();
 
         // 初始上下文（无价格时以现金估算净值）
         let init_ctx = Py::new(
@@ -399,7 +530,8 @@ impl BacktestEngine {
                         let commission = exec_price * fill_size * self.cfg.commission_rate;
 
                         // 快速持仓更新
-                        self.update_position(&mut pos, &order, exec_price, fill_size, commission);
+                        let realized_delta = self
+                            .update_position(&mut pos, &order, exec_price, fill_size, commission);
                         let side = match order.side {
                             OrderSide::Buy => "BUY".to_string(),
                             OrderSide::Sell => "SELL".to_string(),
@@ -412,6 +544,7 @@ impl BacktestEngine {
                             size: fill_size,
                             datetime: bar_data.datetime.clone(),
                             commission,
+                            realized_pnl: realized_delta,
                         });
 
                         // 成交回调
@@ -425,6 +558,7 @@ impl BacktestEngine {
                             trade_evt.set_item("datetime", dt)?;
                         }
                         trade_evt.set_item("commission", commission)?;
+                        trade_evt.set_item("realized_pnl", realized_delta)?;
                         let _ = strategy.call_method1(py, "on_trade", (trade_evt.as_any(),));
 
                         // 订单完成回调
@@ -628,36 +762,82 @@ impl BacktestEngine {
         exec_price: f64,
         fill_size: f64,
         commission: f64,
-    ) {
+    ) -> f64 {
         match order.side {
             OrderSide::Buy => {
                 let cost = exec_price * fill_size + commission;
-                let new_pos = pos.position + fill_size;
-                if new_pos.abs() > f64::EPSILON {
-                    pos.avg_cost = if pos.position.abs() > f64::EPSILON {
-                        (pos.avg_cost * pos.position + exec_price * fill_size) / new_pos
-                    } else {
-                        exec_price
-                    };
-                } else {
-                    pos.avg_cost = 0.0;
-                }
-                pos.position = new_pos;
                 pos.cash -= cost;
             }
             OrderSide::Sell => {
                 let proceeds = exec_price * fill_size - commission;
-                if pos.position > 0.0 {
-                    let closing = fill_size.min(pos.position);
-                    pos.realized_pnl += (exec_price - pos.avg_cost) * closing;
-                }
-                pos.position -= fill_size;
-                if pos.position.abs() < f64::EPSILON {
-                    pos.avg_cost = 0.0;
-                }
                 pos.cash += proceeds;
             }
         }
+        let realized = Self::apply_position_fill(
+            &mut pos.position,
+            &mut pos.avg_cost,
+            order.side,
+            exec_price,
+            fill_size,
+        );
+        pos.realized_pnl += realized;
+        realized
+    }
+
+    fn apply_position_fill(
+        position: &mut f64,
+        avg_cost: &mut f64,
+        side: OrderSide,
+        exec_price: f64,
+        fill_size: f64,
+    ) -> f64 {
+        if fill_size <= 0.0 {
+            return 0.0;
+        }
+
+        let signed_fill = match side {
+            OrderSide::Buy => fill_size,
+            OrderSide::Sell => -fill_size,
+        };
+        let old_pos = *position;
+
+        if old_pos.abs() < f64::EPSILON {
+            *position = signed_fill;
+            *avg_cost = if signed_fill.abs() < f64::EPSILON {
+                0.0
+            } else {
+                exec_price
+            };
+            return 0.0;
+        }
+
+        if old_pos.signum() == signed_fill.signum() {
+            let old_abs = old_pos.abs();
+            let new_abs = old_abs + fill_size;
+            *avg_cost = ((*avg_cost * old_abs) + (exec_price * fill_size)) / new_abs;
+            *position = old_pos + signed_fill;
+            return 0.0;
+        }
+
+        let closing = fill_size.min(old_pos.abs());
+        let realized = if old_pos > 0.0 {
+            (exec_price - *avg_cost) * closing
+        } else {
+            (*avg_cost - exec_price) * closing
+        };
+
+        let new_pos = old_pos + signed_fill;
+        if new_pos.abs() < f64::EPSILON {
+            *position = 0.0;
+            *avg_cost = 0.0;
+        } else if new_pos.signum() == old_pos.signum() {
+            *position = new_pos;
+        } else {
+            *position = new_pos;
+            *avg_cost = exec_price;
+        }
+
+        realized
     }
 
     fn build_result<'py>(
@@ -704,12 +884,13 @@ impl BacktestEngine {
                 t.set_item("datetime", py.None())?;
             }
             t.set_item("commission", trade.commission)?;
+            t.set_item("realized_pnl", trade.realized_pnl)?;
             tr_list.append(t)?;
         }
         result.set_item("trades", tr_list)?;
 
         // 增强的统计分析
-        let stats = self.compute_enhanced_stats(py, &equity_curve, &trades)?;
+        let stats = self.compute_enhanced_stats(py, &equity_curve, &trades, pos.realized_pnl)?;
         result.set_item("stats", stats)?;
 
         Ok(result.into())
@@ -720,6 +901,7 @@ impl BacktestEngine {
         py: Python<'py>,
         equity_curve: &[(Option<String>, f64)],
         trades: &[TradeRecord],
+        realized_pnl: f64,
     ) -> PyResult<PyObject> {
         if equity_curve.is_empty() {
             return Ok(PyDict::new_bound(py).into());
@@ -732,14 +914,16 @@ impl BacktestEngine {
         } else {
             0.0
         };
+        let total_pnl = end_equity - start_equity;
+        let unrealized_pnl = total_pnl - realized_pnl;
 
         // 向量化收益率计算
         let mut returns: Vec<f64> = Vec::with_capacity(equity_curve.len().saturating_sub(1));
         for i in 1..equity_curve.len() {
             let prev = equity_curve[i - 1].1;
             let curr = equity_curve[i].1;
-            if prev != 0.0 {
-                returns.push((curr / prev) - 1.0);
+            if prev.abs() > f64::EPSILON {
+                returns.push((curr - prev) / prev.abs());
             }
         }
 
@@ -755,8 +939,26 @@ impl BacktestEngine {
             0.0
         };
         let std = var.sqrt();
-        let sharpe = if std > 0.0 {
-            (mean_return * 252.0_f64.sqrt()) / std
+        let elapsed_years = equity_curve_elapsed_years(equity_curve);
+        let periods_per_year = elapsed_years
+            .filter(|years| *years > 0.0)
+            .map(|years| returns.len() as f64 / years)
+            .filter(|factor| factor.is_finite() && *factor > 0.0)
+            .unwrap_or(252.0);
+        let annualized_return = if let Some(years) = elapsed_years {
+            if start_equity > 0.0 && end_equity > 0.0 {
+                (end_equity / start_equity).powf(1.0 / years) - 1.0
+            } else {
+                total_return / years
+            }
+        } else if returns.is_empty() {
+            total_return
+        } else {
+            mean_return * periods_per_year
+        };
+        let annualized_volatility = std * periods_per_year.sqrt();
+        let sharpe = if annualized_volatility > 0.0 {
+            annualized_return / annualized_volatility
         } else {
             0.0
         };
@@ -785,38 +987,32 @@ impl BacktestEngine {
 
         // 交易统计
         let total_trades = trades.len();
-        let (winning_trades, losing_trades, total_pnl) = {
+        let (closed_trades, winning_trades, losing_trades) = {
+            let mut closed = 0;
             let mut win = 0;
             let mut lose = 0;
-            let mut pnl = 0.0;
 
-            for i in 0..trades.len() {
-                let trade = &trades[i];
-                if i > 0 {
-                    let prev_price = trades[i - 1].price;
-                    let profit = if trade.side == "BUY" {
-                        (trade.price - prev_price) * trade.size
-                    } else {
-                        (prev_price - trade.price) * trade.size
-                    };
-                    pnl += profit;
-                    if profit > 0.0 {
-                        win += 1;
-                    } else if profit < 0.0 {
-                        lose += 1;
-                    }
+            for trade in trades {
+                if trade.realized_pnl.abs() <= f64::EPSILON {
+                    continue;
+                }
+                closed += 1;
+                if trade.realized_pnl > 0.0 {
+                    win += 1;
+                } else {
+                    lose += 1;
                 }
             }
-            (win, lose, pnl)
+            (closed, win, lose)
         };
 
-        let win_rate = if total_trades > 0 {
-            winning_trades as f64 / total_trades as f64
+        let win_rate = if closed_trades > 0 {
+            winning_trades as f64 / closed_trades as f64
         } else {
             0.0
         };
         let calmar = if max_dd > 0.0 {
-            (mean_return * 252.0) / max_dd
+            annualized_return / max_dd
         } else {
             0.0
         };
@@ -825,17 +1021,20 @@ impl BacktestEngine {
         stats.set_item("start_equity", start_equity)?;
         stats.set_item("end_equity", end_equity)?;
         stats.set_item("total_return", total_return)?;
-        stats.set_item("annualized_return", mean_return * 252.0)?;
-        stats.set_item("volatility", std * (252.0_f64.sqrt()))?;
+        stats.set_item("annualized_return", annualized_return)?;
+        stats.set_item("volatility", annualized_volatility)?;
         stats.set_item("sharpe", sharpe)?;
         stats.set_item("calmar", calmar)?;
         stats.set_item("max_drawdown", max_dd)?;
         stats.set_item("max_dd_duration", max_dd_duration)?;
         stats.set_item("total_trades", total_trades)?;
+        stats.set_item("closed_trades", closed_trades)?;
         stats.set_item("winning_trades", winning_trades)?;
         stats.set_item("losing_trades", losing_trades)?;
         stats.set_item("win_rate", win_rate)?;
         stats.set_item("total_pnl", total_pnl)?;
+        stats.set_item("realized_pnl", realized_pnl)?;
+        stats.set_item("unrealized_pnl", unrealized_pnl)?;
 
         Ok(stats.into())
     }
@@ -850,13 +1049,14 @@ impl BacktestEngine {
         feeds: &'py PyAny,
     ) -> PyResult<PyObject> {
         let feeds_dict: &PyDict = feeds.downcast()?;
+        let date_range = DateRange::from_config(&self.cfg)?;
         // 预提取每个 feed 的数据
         let mut feed_ids: Vec<String> = Vec::with_capacity(feeds_dict.len());
         let mut feed_bars: Vec<Vec<BarData>> = Vec::with_capacity(feeds_dict.len());
         for (k, v) in feeds_dict.iter() {
             let fid: String = k.extract()?;
             let blist: &PyList = v.downcast()?;
-            let bars_vec = extract_bars_data(blist)?;
+            let bars_vec = filter_bars_by_date_range(extract_bars_data(blist)?, &date_range)?;
             feed_ids.push(fid);
             feed_bars.push(bars_vec);
         }
@@ -1031,32 +1231,17 @@ impl BacktestEngine {
                     match order.side {
                         OrderSide::Buy => {
                             let cost = exec_price * fill_size + commission;
-                            let new_pos = sp.0 + fill_size;
-                            if new_pos.abs() > f64::EPSILON {
-                                sp.1 = if sp.0.abs() > f64::EPSILON {
-                                    (sp.1 * sp.0 + exec_price * fill_size) / new_pos
-                                } else {
-                                    exec_price
-                                };
-                            } else {
-                                sp.1 = 0.0;
-                            }
-                            sp.0 = new_pos;
                             cash -= cost;
                         }
                         OrderSide::Sell => {
                             let proceeds = exec_price * fill_size - commission;
-                            if sp.0 > 0.0 {
-                                let closing = fill_size.min(sp.0);
-                                realized_pnl += (exec_price - sp.1) * closing;
-                            }
-                            sp.0 -= fill_size;
-                            if sp.0.abs() < f64::EPSILON {
-                                sp.1 = 0.0;
-                            }
                             cash += proceeds;
                         }
                     }
+                    let realized_delta = Self::apply_position_fill(
+                        &mut sp.0, &mut sp.1, order.side, exec_price, fill_size,
+                    );
+                    realized_pnl += realized_delta;
 
                     // 记录交易与回调
                     let side = match order.side {
@@ -1071,6 +1256,7 @@ impl BacktestEngine {
                         size: fill_size,
                         datetime: Some(cur_dt.clone()),
                         commission,
+                        realized_pnl: realized_delta,
                     });
                     let trade_evt = PyDict::new_bound(py);
                     trade_evt.set_item("order_id", order.id)?;
@@ -1080,6 +1266,7 @@ impl BacktestEngine {
                     trade_evt.set_item("symbol", &order.symbol)?;
                     trade_evt.set_item("datetime", &cur_dt)?;
                     trade_evt.set_item("commission", commission)?;
+                    trade_evt.set_item("realized_pnl", realized_delta)?;
                     let _ = strategy.call_method1(py, "on_trade", (trade_evt.as_any(),));
                 }
             }
@@ -1134,11 +1321,12 @@ impl BacktestEngine {
                 t.set_item("datetime", py.None())?;
             }
             t.set_item("commission", trade.commission)?;
+            t.set_item("realized_pnl", trade.realized_pnl)?;
             tr_list.append(t)?;
         }
         result.set_item("trades", tr_list)?;
 
-        let stats = self.compute_enhanced_stats(py, &equity_curve, &trades)?;
+        let stats = self.compute_enhanced_stats(py, &equity_curve, &trades, realized_pnl)?;
         result.set_item("stats", stats)?;
 
         Ok(result.into())
