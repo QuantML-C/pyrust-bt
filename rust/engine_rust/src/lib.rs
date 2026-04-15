@@ -37,12 +37,18 @@ pub struct BacktestConfig {
     pub slippage_bps: f64,
     #[pyo3(get)]
     pub batch_size: usize, // 新增：批处理大小
+    #[pyo3(get)]
+    pub allow_short: bool,
+    #[pyo3(get)]
+    pub reject_on_insufficient_cash: bool,
+    #[pyo3(get)]
+    pub max_leverage: Option<f64>,
 }
 
 #[pymethods]
 impl BacktestConfig {
     #[new]
-    #[pyo3(signature = (start, end, cash, commission_rate=0.0, slippage_bps=0.0, batch_size=1000))]
+    #[pyo3(signature = (start, end, cash, commission_rate=0.0, slippage_bps=0.0, batch_size=1000, allow_short=true, reject_on_insufficient_cash=false, max_leverage=None))]
     fn new(
         start: String,
         end: String,
@@ -50,6 +56,9 @@ impl BacktestConfig {
         commission_rate: f64,
         slippage_bps: f64,
         batch_size: usize,
+        allow_short: bool,
+        reject_on_insufficient_cash: bool,
+        max_leverage: Option<f64>,
     ) -> Self {
         Self {
             start,
@@ -58,6 +67,9 @@ impl BacktestConfig {
             commission_rate,
             slippage_bps,
             batch_size,
+            allow_short,
+            reject_on_insufficient_cash,
+            max_leverage,
         }
     }
 }
@@ -208,7 +220,6 @@ struct Order {
     otype: OrderType,
     size: f64,
     limit_price: Option<f64>,
-    status: &'static str,
     symbol: String,
 }
 
@@ -222,6 +233,23 @@ struct TradeRecord {
     datetime: Option<String>,
     commission: f64,
     realized_pnl: f64,
+}
+
+#[derive(Clone, Debug)]
+struct OrderRecord {
+    order_id: u64,
+    symbol: String,
+    side: String,
+    otype: String,
+    size: f64,
+    limit_price: Option<f64>,
+    status: String,
+    datetime: Option<String>,
+    filled_price: Option<f64>,
+    filled_size: f64,
+    commission: f64,
+    realized_pnl: f64,
+    reject_reason: Option<String>,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -423,8 +451,16 @@ impl BacktestEngine {
 
         // 预提取所有bar数据到Rust结构中
         let date_range = DateRange::from_config(&self.cfg)?;
-        let bars_data = filter_bars_by_date_range(extract_bars_data(bars)?, &date_range)?;
+        let raw_bars_data = extract_bars_data(bars)?;
+        let raw_bar_count = raw_bars_data.len();
+        let bars_data = filter_bars_by_date_range(raw_bars_data, &date_range)?;
         let n_bars = bars_data.len();
+        if date_range.is_active() && raw_bar_count > 0 && n_bars == 0 {
+            return Err(PyValueError::new_err(format!(
+                "BacktestConfig start/end produced no bars: start='{}', end='{}'",
+                self.cfg.start, self.cfg.end
+            )));
+        }
 
         // 初始上下文（无价格时以现金估算净值）
         let init_ctx = Py::new(
@@ -446,6 +482,7 @@ impl BacktestEngine {
         // 预分配容量
         let mut equity_curve: Vec<(Option<String>, f64)> = Vec::with_capacity(n_bars);
         let mut trades: Vec<TradeRecord> = Vec::with_capacity(n_bars / 100);
+        let mut orders: Vec<OrderRecord> = Vec::with_capacity(n_bars / 100);
 
         // 批量处理策略调用，减少Python GIL争用
         let batch_size = self.cfg.batch_size.max(1).min(n_bars.max(1));
@@ -499,20 +536,8 @@ impl BacktestEngine {
                     let evt = PyDict::new_bound(py);
                     evt.set_item("event", "submitted")?;
                     evt.set_item("order_id", order.id)?;
-                    evt.set_item(
-                        "side",
-                        match order.side {
-                            OrderSide::Buy => "BUY",
-                            OrderSide::Sell => "SELL",
-                        },
-                    )?;
-                    evt.set_item(
-                        "type",
-                        match order.otype {
-                            OrderType::Market => "market",
-                            OrderType::Limit => "limit",
-                        },
-                    )?;
+                    evt.set_item("side", Self::side_str(order.side))?;
+                    evt.set_item("type", Self::order_type_str(order.otype))?;
                     evt.set_item("size", order.size)?;
                     evt.set_item("symbol", &order.symbol)?;
                     if let Some(lp) = order.limit_price {
@@ -529,13 +554,33 @@ impl BacktestEngine {
                         let exec_price = fill_price * (1.0 + sign * slip);
                         let commission = exec_price * fill_size * self.cfg.commission_rate;
 
+                        if let Some(reason) = self.validate_single_fill(
+                            &pos, &order, exec_price, fill_size, commission, last_price,
+                        ) {
+                            orders.push(Self::order_record(
+                                &order,
+                                bar_data.datetime.clone(),
+                                "rejected",
+                                None,
+                                0.0,
+                                0.0,
+                                0.0,
+                                Some(reason.clone()),
+                            ));
+                            let rejected_evt = PyDict::new_bound(py);
+                            rejected_evt.set_item("event", "rejected")?;
+                            rejected_evt.set_item("order_id", order.id)?;
+                            rejected_evt.set_item("reason", reason)?;
+                            let _ = strategy.call_method1(py, "on_order", (rejected_evt.as_any(),));
+                            let equity = pos.cash + pos.position * last_price;
+                            equity_curve.push((bar_data.datetime.clone(), equity));
+                            continue;
+                        }
+
                         // 快速持仓更新
                         let realized_delta = self
                             .update_position(&mut pos, &order, exec_price, fill_size, commission);
-                        let side = match order.side {
-                            OrderSide::Buy => "BUY".to_string(),
-                            OrderSide::Sell => "SELL".to_string(),
-                        };
+                        let side = Self::side_str(order.side).to_string();
                         trades.push(TradeRecord {
                             order_id: order.id,
                             symbol: order.symbol.clone(),
@@ -546,6 +591,16 @@ impl BacktestEngine {
                             commission,
                             realized_pnl: realized_delta,
                         });
+                        orders.push(Self::order_record(
+                            &order,
+                            bar_data.datetime.clone(),
+                            "filled",
+                            Some(exec_price),
+                            fill_size,
+                            commission,
+                            realized_delta,
+                            None,
+                        ));
 
                         // 成交回调
                         let trade_evt = PyDict::new_bound(py);
@@ -566,6 +621,17 @@ impl BacktestEngine {
                         evt2.set_item("event", "filled")?;
                         evt2.set_item("order_id", order.id)?;
                         let _ = strategy.call_method1(py, "on_order", (evt2.as_any(),));
+                    } else {
+                        orders.push(Self::order_record(
+                            &order,
+                            bar_data.datetime.clone(),
+                            "unfilled",
+                            None,
+                            0.0,
+                            0.0,
+                            0.0,
+                            None,
+                        ));
                     }
                 }
 
@@ -577,7 +643,7 @@ impl BacktestEngine {
         let _ = strategy.call_method0(py, "on_stop");
 
         // 构建结果（优化版）
-        self.build_result(py, pos, equity_curve, trades)
+        self.build_result(py, pos, equity_curve, trades, orders)
     }
 
     /// 多资产/多周期（按联合时间线）回测（Python 暴露方法）
@@ -592,6 +658,87 @@ impl BacktestEngine {
 }
 
 impl BacktestEngine {
+    fn side_str(side: OrderSide) -> &'static str {
+        match side {
+            OrderSide::Buy => "BUY",
+            OrderSide::Sell => "SELL",
+        }
+    }
+
+    fn order_type_str(otype: OrderType) -> &'static str {
+        match otype {
+            OrderType::Market => "market",
+            OrderType::Limit => "limit",
+        }
+    }
+
+    fn order_record(
+        order: &Order,
+        datetime: Option<String>,
+        status: &str,
+        filled_price: Option<f64>,
+        filled_size: f64,
+        commission: f64,
+        realized_pnl: f64,
+        reject_reason: Option<String>,
+    ) -> OrderRecord {
+        OrderRecord {
+            order_id: order.id,
+            symbol: order.symbol.clone(),
+            side: Self::side_str(order.side).to_string(),
+            otype: Self::order_type_str(order.otype).to_string(),
+            size: order.size,
+            limit_price: order.limit_price,
+            status: status.to_string(),
+            datetime,
+            filled_price,
+            filled_size,
+            commission,
+            realized_pnl,
+            reject_reason,
+        }
+    }
+
+    fn validate_action_side(action: &str) -> PyResult<OrderSide> {
+        match action.trim().to_ascii_uppercase().as_str() {
+            "BUY" => Ok(OrderSide::Buy),
+            "SELL" => Ok(OrderSide::Sell),
+            other => Err(PyValueError::new_err(format!(
+                "invalid action '{other}'; expected BUY or SELL"
+            ))),
+        }
+    }
+
+    fn validate_order_type(otype: &str) -> PyResult<OrderType> {
+        match otype.trim().to_ascii_lowercase().as_str() {
+            "market" => Ok(OrderType::Market),
+            "limit" => Ok(OrderType::Limit),
+            other => Err(PyValueError::new_err(format!(
+                "invalid order type '{other}'; expected market or limit"
+            ))),
+        }
+    }
+
+    fn validate_size(size: f64) -> PyResult<f64> {
+        if size.is_finite() && size > 0.0 {
+            Ok(size)
+        } else {
+            Err(PyValueError::new_err(format!(
+                "order size must be a positive finite number, got {size}"
+            )))
+        }
+    }
+
+    fn validate_price(price: f64, field_name: &str) -> PyResult<f64> {
+        if price.is_finite() && price > 0.0 {
+            Ok(price)
+        } else {
+            Err(PyValueError::new_err(format!(
+                "{field_name} must be a positive finite number, got {price}"
+            )))
+        }
+    }
+
     fn method_accepts_ctx<'py>(
         &self,
         py: Python<'py>,
@@ -612,69 +759,86 @@ impl BacktestEngine {
         &self,
         action_obj: &PyAny,
         order_seq: &mut u64,
-        last_price: f64,
+        _last_price: f64,
         default_symbol: &str,
     ) -> PyResult<Option<Order>> {
-        // 快速字符串检查
-        if let Ok(s) = action_obj.extract::<Option<String>>() {
-            if let Some(act) = s {
-                let side = if act.as_bytes()[0] == b'B' {
-                    OrderSide::Buy
-                } else {
-                    OrderSide::Sell
-                };
-                let id = *order_seq;
-                *order_seq += 1;
-                return Ok(Some(Order {
-                    id,
-                    side,
-                    otype: OrderType::Market,
-                    size: 1.0,
-                    limit_price: None,
-                    status: "submitted",
-                    symbol: default_symbol.to_string(),
-                }));
-            }
+        if action_obj.is_none() {
+            return Ok(None);
         }
 
-        // 字典解析
+        if let Ok(act) = action_obj.extract::<String>() {
+            if act.trim().is_empty() {
+                return Ok(None);
+            }
+            let id = *order_seq;
+            *order_seq += 1;
+            return Ok(Some(Order {
+                id,
+                side: Self::validate_action_side(&act)?,
+                otype: OrderType::Market,
+                size: 1.0,
+                limit_price: None,
+                symbol: default_symbol.to_string(),
+            }));
+        }
+
         if let Ok(d) = action_obj.downcast::<PyDict>() {
-            let act = d
-                .get_item("action")?
-                .and_then(|v| v.extract::<String>().ok())
-                .unwrap_or_default();
-            if act.is_empty() {
+            let act = match d.get_item("action")? {
+                Some(v) => v
+                    .extract::<String>()
+                    .map_err(|_| PyValueError::new_err("action must be a string: BUY or SELL"))?,
+                None => return Ok(None),
+            };
+            if act.trim().is_empty() {
                 return Ok(None);
             }
 
-            let side = if act.as_bytes()[0] == b'B' {
-                OrderSide::Buy
-            } else {
-                OrderSide::Sell
+            let side = Self::validate_action_side(&act)?;
+            let otype = match d.get_item("type")? {
+                Some(v) => {
+                    let otype_str = v.extract::<String>().map_err(|_| {
+                        PyValueError::new_err("order type must be a string: market or limit")
+                    })?;
+                    Self::validate_order_type(&otype_str)?
+                }
+                None => OrderType::Market,
             };
-            let otype_str = d
-                .get_item("type")?
-                .and_then(|v| v.extract::<String>().ok())
-                .unwrap_or_else(|| "market".into());
-            let otype = if otype_str == "limit" {
-                OrderType::Limit
-            } else {
-                OrderType::Market
+            let size = match d.get_item("size")? {
+                Some(v) => Self::validate_size(
+                    v.extract::<f64>()
+                        .map_err(|_| PyValueError::new_err("order size must be numeric"))?,
+                )?,
+                None => 1.0,
             };
-            let size = d
-                .get_item("size")?
-                .and_then(|v| v.extract::<f64>().ok())
-                .unwrap_or(1.0);
-            let price = d.get_item("price")?.and_then(|v| v.extract::<f64>().ok());
-            let symbol = d
-                .get_item("symbol")?
-                .and_then(|v| v.extract::<String>().ok())
-                .unwrap_or_else(|| default_symbol.to_string());
+            let price = match d.get_item("price")? {
+                Some(v) => Some(Self::validate_price(
+                    v.extract::<f64>()
+                        .map_err(|_| PyValueError::new_err("order price must be numeric"))?,
+                    "order price",
+                )?),
+                None => None,
+            };
+            let symbol = match d.get_item("symbol")? {
+                Some(v) => {
+                    let s = v.extract::<String>().map_err(|_| {
+                        PyValueError::new_err("order symbol must be a non-empty string")
+                    })?;
+                    if s.trim().is_empty() {
+                        return Err(PyValueError::new_err(
+                            "order symbol must be a non-empty string",
+                        ));
+                    }
+                    s
+                }
+                None => default_symbol.to_string(),
+            };
 
             let id = *order_seq;
             *order_seq += 1;
             let limit_price = if otype == OrderType::Limit {
-                price.or(Some(last_price))
+                Some(price.ok_or_else(|| {
+                    PyValueError::new_err("limit order requires a positive price")
+                })?)
             } else {
                 None
             };
@@ -684,12 +848,13 @@ impl BacktestEngine {
                 otype,
                 size,
                 limit_price,
-                status: "submitted",
                 symbol,
             }));
         }
 
-        Ok(None)
+        Err(PyValueError::new_err(
+            "strategy action must be None, BUY/SELL string, action dict, or list of action dicts",
+        ))
     }
 
     // 解析多指令：支持 list/tuple；若为单个则返回单元素
@@ -752,6 +917,141 @@ impl BacktestEngine {
                 }
             }
         }
+    }
+
+    fn validate_single_fill(
+        &self,
+        pos: &PositionState,
+        order: &Order,
+        exec_price: f64,
+        fill_size: f64,
+        commission: f64,
+        last_price: f64,
+    ) -> Option<String> {
+        if !self.cfg.allow_short && order.side == OrderSide::Sell {
+            let next_pos = pos.position - fill_size;
+            if next_pos < -f64::EPSILON {
+                return Some("short selling is disabled".to_string());
+            }
+        }
+
+        if self.cfg.reject_on_insufficient_cash && order.side == OrderSide::Buy {
+            let cost = exec_price * fill_size + commission;
+            if cost > pos.cash + f64::EPSILON {
+                return Some(format!(
+                    "insufficient cash: required {cost}, available {}",
+                    pos.cash
+                ));
+            }
+        }
+
+        if let Some(max_leverage) = self.cfg.max_leverage {
+            if max_leverage.is_finite() && max_leverage >= 0.0 {
+                let mut next_cash = pos.cash;
+                let mut next_position = pos.position;
+                match order.side {
+                    OrderSide::Buy => {
+                        next_cash -= exec_price * fill_size + commission;
+                        next_position += fill_size;
+                    }
+                    OrderSide::Sell => {
+                        next_cash += exec_price * fill_size - commission;
+                        next_position -= fill_size;
+                    }
+                }
+                let equity = next_cash + next_position * last_price;
+                let exposure = (next_position * last_price).abs();
+                if equity <= 0.0 {
+                    return Some("order would make account equity non-positive".to_string());
+                }
+                let leverage = exposure / equity;
+                if leverage > max_leverage + f64::EPSILON {
+                    return Some(format!(
+                        "max leverage exceeded: {leverage} > {max_leverage}"
+                    ));
+                }
+            }
+        }
+
+        None
+    }
+
+    fn validate_multi_fill(
+        &self,
+        cash: f64,
+        positions: &HashMap<String, (f64, f64)>,
+        last_price_map: &HashMap<String, f64>,
+        order: &Order,
+        exec_price: f64,
+        fill_size: f64,
+        commission: f64,
+    ) -> Option<String> {
+        if !last_price_map.contains_key(&order.symbol) {
+            return Some(format!("no market price for symbol {}", order.symbol));
+        }
+
+        let current_position = positions.get(&order.symbol).map(|(p, _)| *p).unwrap_or(0.0);
+        let signed_fill = match order.side {
+            OrderSide::Buy => fill_size,
+            OrderSide::Sell => -fill_size,
+        };
+        let next_symbol_position = current_position + signed_fill;
+
+        if !self.cfg.allow_short && next_symbol_position < -f64::EPSILON {
+            return Some(format!(
+                "short selling is disabled for symbol {}",
+                order.symbol
+            ));
+        }
+
+        if self.cfg.reject_on_insufficient_cash && order.side == OrderSide::Buy {
+            let cost = exec_price * fill_size + commission;
+            if cost > cash + f64::EPSILON {
+                return Some(format!(
+                    "insufficient cash: required {cost}, available {cash}"
+                ));
+            }
+        }
+
+        if let Some(max_leverage) = self.cfg.max_leverage {
+            if max_leverage.is_finite() && max_leverage >= 0.0 {
+                let next_cash = match order.side {
+                    OrderSide::Buy => cash - exec_price * fill_size - commission,
+                    OrderSide::Sell => cash + exec_price * fill_size - commission,
+                };
+
+                let mut equity = next_cash;
+                let mut exposure = 0.0;
+                for (sym, (position, _)) in positions {
+                    let next_position = if sym == &order.symbol {
+                        next_symbol_position
+                    } else {
+                        *position
+                    };
+                    if let Some(price) = last_price_map.get(sym) {
+                        equity += next_position * price;
+                        exposure += (next_position * price).abs();
+                    }
+                }
+                if !positions.contains_key(&order.symbol) {
+                    if let Some(price) = last_price_map.get(&order.symbol) {
+                        equity += next_symbol_position * price;
+                        exposure += (next_symbol_position * price).abs();
+                    }
+                }
+                if equity <= 0.0 {
+                    return Some("order would make account equity non-positive".to_string());
+                }
+                let leverage = exposure / equity;
+                if leverage > max_leverage + f64::EPSILON {
+                    return Some(format!(
+                        "max leverage exceeded: {leverage} > {max_leverage}"
+                    ));
+                }
+            }
+        }
+
+        None
     }
 
     #[inline]
@@ -846,6 +1146,7 @@ impl BacktestEngine {
         pos: PositionState,
         equity_curve: Vec<(Option<String>, f64)>,
         trades: Vec<TradeRecord>,
+        orders: Vec<OrderRecord>,
     ) -> PyResult<PyObject> {
         let result = PyDict::new_bound(py);
         result.set_item("cash", pos.cash)?;
@@ -889,8 +1190,45 @@ impl BacktestEngine {
         }
         result.set_item("trades", tr_list)?;
 
+        let order_list = PyList::empty_bound(py);
+        for order in &orders {
+            let row = PyDict::new_bound(py);
+            row.set_item("order_id", order.order_id)?;
+            row.set_item("symbol", &order.symbol)?;
+            row.set_item("side", &order.side)?;
+            row.set_item("type", &order.otype)?;
+            row.set_item("size", order.size)?;
+            if let Some(limit_price) = order.limit_price {
+                row.set_item("limit_price", limit_price)?;
+            } else {
+                row.set_item("limit_price", py.None())?;
+            }
+            row.set_item("status", &order.status)?;
+            if let Some(dt) = &order.datetime {
+                row.set_item("datetime", dt)?;
+            } else {
+                row.set_item("datetime", py.None())?;
+            }
+            if let Some(filled_price) = order.filled_price {
+                row.set_item("filled_price", filled_price)?;
+            } else {
+                row.set_item("filled_price", py.None())?;
+            }
+            row.set_item("filled_size", order.filled_size)?;
+            row.set_item("commission", order.commission)?;
+            row.set_item("realized_pnl", order.realized_pnl)?;
+            if let Some(reason) = &order.reject_reason {
+                row.set_item("reject_reason", reason)?;
+            } else {
+                row.set_item("reject_reason", py.None())?;
+            }
+            order_list.append(row)?;
+        }
+        result.set_item("orders", order_list)?;
+
         // 增强的统计分析
-        let stats = self.compute_enhanced_stats(py, &equity_curve, &trades, pos.realized_pnl)?;
+        let stats =
+            self.compute_enhanced_stats(py, &equity_curve, &trades, &orders, pos.realized_pnl)?;
         result.set_item("stats", stats)?;
 
         Ok(result.into())
@@ -901,6 +1239,7 @@ impl BacktestEngine {
         py: Python<'py>,
         equity_curve: &[(Option<String>, f64)],
         trades: &[TradeRecord],
+        orders: &[OrderRecord],
         realized_pnl: f64,
     ) -> PyResult<PyObject> {
         if equity_curve.is_empty() {
@@ -987,10 +1326,13 @@ impl BacktestEngine {
 
         // 交易统计
         let total_trades = trades.len();
-        let (closed_trades, winning_trades, losing_trades) = {
+        let commission_total: f64 = trades.iter().map(|trade| trade.commission).sum();
+        let (closed_trades, winning_trades, losing_trades, gross_profit, gross_loss) = {
             let mut closed = 0;
             let mut win = 0;
             let mut lose = 0;
+            let mut profit = 0.0;
+            let mut loss = 0.0;
 
             for trade in trades {
                 if trade.realized_pnl.abs() <= f64::EPSILON {
@@ -999,11 +1341,13 @@ impl BacktestEngine {
                 closed += 1;
                 if trade.realized_pnl > 0.0 {
                     win += 1;
+                    profit += trade.realized_pnl;
                 } else {
                     lose += 1;
+                    loss += -trade.realized_pnl;
                 }
             }
-            (closed, win, lose)
+            (closed, win, lose, profit, loss)
         };
 
         let win_rate = if closed_trades > 0 {
@@ -1011,6 +1355,35 @@ impl BacktestEngine {
         } else {
             0.0
         };
+        let avg_win = if winning_trades > 0 {
+            gross_profit / winning_trades as f64
+        } else {
+            0.0
+        };
+        let avg_loss = if losing_trades > 0 {
+            gross_loss / losing_trades as f64
+        } else {
+            0.0
+        };
+        let profit_factor = if gross_loss > 0.0 {
+            gross_profit / gross_loss
+        } else if gross_profit > 0.0 {
+            f64::INFINITY
+        } else {
+            0.0
+        };
+        let filled_orders = orders
+            .iter()
+            .filter(|order| order.status == "filled")
+            .count();
+        let rejected_orders = orders
+            .iter()
+            .filter(|order| order.status == "rejected")
+            .count();
+        let unfilled_orders = orders
+            .iter()
+            .filter(|order| order.status == "unfilled")
+            .count();
         let calmar = if max_dd > 0.0 {
             annualized_return / max_dd
         } else {
@@ -1035,6 +1408,16 @@ impl BacktestEngine {
         stats.set_item("total_pnl", total_pnl)?;
         stats.set_item("realized_pnl", realized_pnl)?;
         stats.set_item("unrealized_pnl", unrealized_pnl)?;
+        stats.set_item("commission_total", commission_total)?;
+        stats.set_item("gross_profit", gross_profit)?;
+        stats.set_item("gross_loss", gross_loss)?;
+        stats.set_item("profit_factor", profit_factor)?;
+        stats.set_item("avg_win", avg_win)?;
+        stats.set_item("avg_loss", avg_loss)?;
+        stats.set_item("total_orders", orders.len())?;
+        stats.set_item("filled_orders", filled_orders)?;
+        stats.set_item("rejected_orders", rejected_orders)?;
+        stats.set_item("unfilled_orders", unfilled_orders)?;
 
         Ok(stats.into())
     }
@@ -1053,12 +1436,23 @@ impl BacktestEngine {
         // 预提取每个 feed 的数据
         let mut feed_ids: Vec<String> = Vec::with_capacity(feeds_dict.len());
         let mut feed_bars: Vec<Vec<BarData>> = Vec::with_capacity(feeds_dict.len());
+        let mut raw_bar_count: usize = 0;
+        let mut filtered_bar_count: usize = 0;
         for (k, v) in feeds_dict.iter() {
             let fid: String = k.extract()?;
             let blist: &PyList = v.downcast()?;
-            let bars_vec = filter_bars_by_date_range(extract_bars_data(blist)?, &date_range)?;
+            let raw_bars = extract_bars_data(blist)?;
+            raw_bar_count += raw_bars.len();
+            let bars_vec = filter_bars_by_date_range(raw_bars, &date_range)?;
+            filtered_bar_count += bars_vec.len();
             feed_ids.push(fid);
             feed_bars.push(bars_vec);
+        }
+        if date_range.is_active() && raw_bar_count > 0 && filtered_bar_count == 0 {
+            return Err(PyValueError::new_err(format!(
+                "BacktestConfig start/end produced no bars across feeds: start='{}', end='{}'",
+                self.cfg.start, self.cfg.end
+            )));
         }
 
         let n_feeds = feed_ids.len();
@@ -1074,6 +1468,7 @@ impl BacktestEngine {
         // 结果容器
         let mut equity_curve: Vec<(Option<String>, f64)> = Vec::new();
         let mut trades: Vec<TradeRecord> = Vec::new();
+        let mut orders_records: Vec<OrderRecord> = Vec::new();
         let mut order_seq: u64 = 1;
         let has_next_multi = strategy.as_ref(py).hasattr("next_multi")?;
         let next_accepts_ctx = self.method_accepts_ctx(py, &strategy, "next")?;
@@ -1213,8 +1608,38 @@ impl BacktestEngine {
                 &default_symbol,
             )?;
             for order in orders {
+                let submitted_evt = PyDict::new_bound(py);
+                submitted_evt.set_item("event", "submitted")?;
+                submitted_evt.set_item("order_id", order.id)?;
+                submitted_evt.set_item("side", Self::side_str(order.side))?;
+                submitted_evt.set_item("type", Self::order_type_str(order.otype))?;
+                submitted_evt.set_item("size", order.size)?;
+                submitted_evt.set_item("symbol", &order.symbol)?;
+                if let Some(lp) = order.limit_price {
+                    submitted_evt.set_item("limit_price", lp)?;
+                }
+                let _ = strategy.call_method1(py, "on_order", (submitted_evt.as_any(),));
+
                 // 获取该 symbol 的 last_price
-                let lp = *last_price_map.get(&order.symbol).unwrap_or(&0.0);
+                let Some(lp) = last_price_map.get(&order.symbol).copied() else {
+                    let reason = format!("no market price for symbol {}", order.symbol);
+                    orders_records.push(Self::order_record(
+                        &order,
+                        Some(cur_dt.clone()),
+                        "rejected",
+                        None,
+                        0.0,
+                        0.0,
+                        0.0,
+                        Some(reason.clone()),
+                    ));
+                    let rejected_evt = PyDict::new_bound(py);
+                    rejected_evt.set_item("event", "rejected")?;
+                    rejected_evt.set_item("order_id", order.id)?;
+                    rejected_evt.set_item("reason", reason)?;
+                    let _ = strategy.call_method1(py, "on_order", (rejected_evt.as_any(),));
+                    continue;
+                };
                 if let Some((fill_price, fill_size)) = self.try_match(&order, lp) {
                     let slip = self.cfg.slippage_bps / 10_000.0;
                     let sign = match order.side {
@@ -1223,6 +1648,33 @@ impl BacktestEngine {
                     };
                     let exec_price = fill_price * (1.0 + sign * slip);
                     let commission = exec_price * fill_size * self.cfg.commission_rate;
+
+                    if let Some(reason) = self.validate_multi_fill(
+                        cash,
+                        &positions,
+                        &last_price_map,
+                        &order,
+                        exec_price,
+                        fill_size,
+                        commission,
+                    ) {
+                        orders_records.push(Self::order_record(
+                            &order,
+                            Some(cur_dt.clone()),
+                            "rejected",
+                            None,
+                            0.0,
+                            0.0,
+                            0.0,
+                            Some(reason.clone()),
+                        ));
+                        let rejected_evt = PyDict::new_bound(py);
+                        rejected_evt.set_item("event", "rejected")?;
+                        rejected_evt.set_item("order_id", order.id)?;
+                        rejected_evt.set_item("reason", reason)?;
+                        let _ = strategy.call_method1(py, "on_order", (rejected_evt.as_any(),));
+                        continue;
+                    }
 
                     // 更新该 symbol 头寸与组合现金
                     let sp = positions
@@ -1258,6 +1710,16 @@ impl BacktestEngine {
                         commission,
                         realized_pnl: realized_delta,
                     });
+                    orders_records.push(Self::order_record(
+                        &order,
+                        Some(cur_dt.clone()),
+                        "filled",
+                        Some(exec_price),
+                        fill_size,
+                        commission,
+                        realized_delta,
+                        None,
+                    ));
                     let trade_evt = PyDict::new_bound(py);
                     trade_evt.set_item("order_id", order.id)?;
                     trade_evt.set_item("side", side)?;
@@ -1268,6 +1730,22 @@ impl BacktestEngine {
                     trade_evt.set_item("commission", commission)?;
                     trade_evt.set_item("realized_pnl", realized_delta)?;
                     let _ = strategy.call_method1(py, "on_trade", (trade_evt.as_any(),));
+
+                    let filled_evt = PyDict::new_bound(py);
+                    filled_evt.set_item("event", "filled")?;
+                    filled_evt.set_item("order_id", order.id)?;
+                    let _ = strategy.call_method1(py, "on_order", (filled_evt.as_any(),));
+                } else {
+                    orders_records.push(Self::order_record(
+                        &order,
+                        Some(cur_dt.clone()),
+                        "unfilled",
+                        None,
+                        0.0,
+                        0.0,
+                        0.0,
+                        None,
+                    ));
                 }
             }
 
@@ -1326,7 +1804,44 @@ impl BacktestEngine {
         }
         result.set_item("trades", tr_list)?;
 
-        let stats = self.compute_enhanced_stats(py, &equity_curve, &trades, realized_pnl)?;
+        let order_list = PyList::empty_bound(py);
+        for order in &orders_records {
+            let row = PyDict::new_bound(py);
+            row.set_item("order_id", order.order_id)?;
+            row.set_item("symbol", &order.symbol)?;
+            row.set_item("side", &order.side)?;
+            row.set_item("type", &order.otype)?;
+            row.set_item("size", order.size)?;
+            if let Some(limit_price) = order.limit_price {
+                row.set_item("limit_price", limit_price)?;
+            } else {
+                row.set_item("limit_price", py.None())?;
+            }
+            row.set_item("status", &order.status)?;
+            if let Some(dt) = &order.datetime {
+                row.set_item("datetime", dt)?;
+            } else {
+                row.set_item("datetime", py.None())?;
+            }
+            if let Some(filled_price) = order.filled_price {
+                row.set_item("filled_price", filled_price)?;
+            } else {
+                row.set_item("filled_price", py.None())?;
+            }
+            row.set_item("filled_size", order.filled_size)?;
+            row.set_item("commission", order.commission)?;
+            row.set_item("realized_pnl", order.realized_pnl)?;
+            if let Some(reason) = &order.reject_reason {
+                row.set_item("reject_reason", reason)?;
+            } else {
+                row.set_item("reject_reason", py.None())?;
+            }
+            order_list.append(row)?;
+        }
+        result.set_item("orders", order_list)?;
+
+        let stats =
+            self.compute_enhanced_stats(py, &equity_curve, &trades, &orders_records, realized_pnl)?;
         result.set_item("stats", stats)?;
 
         Ok(result.into())

@@ -105,6 +105,7 @@ class EngineCoreTests(unittest.TestCase):
 
         result = self.make_engine().run(BuyOnceStrategy(), make_bars(symbol="SINGLE"))
         trade = result["trades"][0]
+        order = result["orders"][0]
 
         for key in (
             "order_id",
@@ -121,6 +122,10 @@ class EngineCoreTests(unittest.TestCase):
         self.assertEqual(trade["datetime"], "2024-01-01 09:30:00")
         self.assertAlmostEqual(trade["commission"], 0.01)
         self.assertAlmostEqual(trade["realized_pnl"], 0.0)
+        self.assertEqual(order["status"], "filled")
+        self.assertEqual(order["symbol"], "SINGLE")
+        self.assertAlmostEqual(order["filled_price"], 10.0)
+        self.assertAlmostEqual(order["commission"], 0.01)
 
     def test_multi_asset_trade_records_include_symbol(self):
         class MultiBuyStrategy(Strategy):
@@ -262,6 +267,79 @@ class EngineCoreTests(unittest.TestCase):
         self.assertEqual(len(result["equity_curve"]), 1)
         self.assertEqual(result["equity_curve"][0]["datetime"], "2024-01-02 09:30:00")
 
+    def test_config_window_without_overlap_raises(self):
+        class NoopStrategy(Strategy):
+            def next(self, bar):
+                return None
+
+        cfg = BacktestConfig(
+            start="2025-01-01",
+            end="2025-12-31",
+            cash=1000.0,
+            commission_rate=0.0,
+            slippage_bps=0.0,
+        )
+
+        with self.assertRaisesRegex(ValueError, "produced no bars"):
+            BacktestEngine(cfg).run(NoopStrategy(), make_bars())
+
+    def test_limit_order_without_price_raises(self):
+        class BadLimitStrategy(Strategy):
+            def next(self, bar):
+                return {"action": "BUY", "type": "limit", "size": 1.0}
+
+        with self.assertRaisesRegex(ValueError, "limit order requires"):
+            self.make_engine().run(BadLimitStrategy(), make_bars())
+
+    def test_invalid_action_raises(self):
+        class BadActionStrategy(Strategy):
+            def next(self, bar):
+                return {"action": "HOLD", "type": "market", "size": 1.0}
+
+        with self.assertRaisesRegex(ValueError, "invalid action"):
+            self.make_engine().run(BadActionStrategy(), make_bars())
+
+    def test_disallow_short_rejects_sell_order(self):
+        class SellStrategy(Strategy):
+            def next(self, bar):
+                return {"action": "SELL", "type": "market", "size": 1.0}
+
+        cfg = BacktestConfig(
+            start="2024-01-01",
+            end="2024-01-02",
+            cash=1000.0,
+            commission_rate=0.0,
+            slippage_bps=0.0,
+            allow_short=False,
+        )
+        result = BacktestEngine(cfg).run(SellStrategy(), make_bars())
+
+        self.assertEqual(len(result["trades"]), 0)
+        self.assertEqual(len(result["orders"]), 2)
+        self.assertEqual(result["orders"][0]["status"], "rejected")
+        self.assertIn("short selling", result["orders"][0]["reject_reason"])
+        self.assertEqual(result["stats"]["rejected_orders"], 2)
+
+    def test_insufficient_cash_rejects_buy_order_when_enabled(self):
+        class BuyTooMuchStrategy(Strategy):
+            def next(self, bar):
+                return {"action": "BUY", "type": "market", "size": 10.0}
+
+        cfg = BacktestConfig(
+            start="2024-01-01",
+            end="2024-01-02",
+            cash=50.0,
+            commission_rate=0.0,
+            slippage_bps=0.0,
+            reject_on_insufficient_cash=True,
+        )
+        result = BacktestEngine(cfg).run(BuyTooMuchStrategy(), make_bars())
+
+        self.assertEqual(len(result["trades"]), 0)
+        self.assertEqual(result["orders"][0]["status"], "rejected")
+        self.assertIn("insufficient cash", result["orders"][0]["reject_reason"])
+        self.assertEqual(result["cash"], 50.0)
+
     def test_annualized_return_uses_total_return_and_elapsed_time(self):
         class BuyOnceStrategy(Strategy):
             def __init__(self):
@@ -358,7 +436,39 @@ class EngineCoreTests(unittest.TestCase):
         self.assertEqual(stats["winning_trades"], 1)
         self.assertEqual(stats["losing_trades"], 0)
         self.assertAlmostEqual(stats["win_rate"], 1.0)
+        self.assertAlmostEqual(stats["commission_total"], 0.0)
+        self.assertAlmostEqual(stats["gross_profit"], 50.0)
+        self.assertAlmostEqual(stats["gross_loss"], 0.0)
+        self.assertGreater(stats["profit_factor"], 0.0)
+        self.assertEqual(stats["total_orders"], 2)
+        self.assertEqual(stats["filled_orders"], 2)
+        self.assertEqual(stats["rejected_orders"], 0)
+        self.assertEqual(stats["unfilled_orders"], 0)
         self.assertAlmostEqual(result["trades"][1]["realized_pnl"], 50.0)
+
+    def test_multi_asset_disallow_short_rejects_symbol_order(self):
+        class MultiSellStrategy(Strategy):
+            def next_multi(self, update_slice, ctx):
+                return {"action": "SELL", "type": "market", "size": 1.0, "symbol": "AAA"}
+
+        feeds = {
+            "AAA": make_bars(symbol="AAA"),
+            "BBB": make_bars(symbol="BBB"),
+        }
+        cfg = BacktestConfig(
+            start="2024-01-01",
+            end="2024-01-02",
+            cash=1000.0,
+            commission_rate=0.0,
+            slippage_bps=0.0,
+            allow_short=False,
+        )
+        result = BacktestEngine(cfg).run_multi(MultiSellStrategy(), feeds)
+
+        self.assertEqual(len(result["trades"]), 0)
+        self.assertEqual(result["orders"][0]["status"], "rejected")
+        self.assertEqual(result["orders"][0]["symbol"], "AAA")
+        self.assertEqual(result["stats"]["rejected_orders"], 2)
 
 
 if __name__ == "__main__":
