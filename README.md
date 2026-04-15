@@ -118,6 +118,7 @@ Read the full architecture notes in [docs/architecture.md](docs/architecture.md)
 | Performance benchmark | `python examples/run_performance_test.py` | Batch-size and speed checks |
 
 See [docs/examples.md](docs/examples.md) for when to use each example.
+For QMT / XtData design details, see [docs/xtdata_market_data_plan.md](docs/xtdata_market_data_plan.md).
 
 ## Engine Model
 

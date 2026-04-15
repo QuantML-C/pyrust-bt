@@ -77,20 +77,6 @@ pip install --force-reinstall (Get-ChildItem target/wheels/engine_rust-*.whl | S
 
 示例数据：`examples/data/sample.csv`（列：`datetime,open,high,low,close,volume`）。
 
-## 行情数据：DuckDB + QMT
-
-### DuckDB 本地行情库
-
-- 项目默认使用 `data/backtest.db` 作为 DuckDB 行情库，数据库文件可放在任意位置（相关示例脚本都支持自定义 `--db`）。
-- 批量导入历史数据：
-
-  ```powershell
-  # 直接把 CSV 写入 DuckDB（依赖已编译好的 engine_rust 扩展）
-  python examples/import_csv_to_db.py data/513500_d.csv --symbol 513500.SH --period 1d --db data/backtest.db
-  ```
-
-- 若需要先查看/校验 CSV，可加 `--no-direct-csv`，使用 Python 解析后再调用 Rust 保存。
-- DuckDB 内部使用 `save_klines`/`save_klines_from_csv` 写入标准化表结构，后续可用 `duckdb` 命令行或其他工具直接查询。
 
 ### 免维护QMT / XtData 自动补数
 
@@ -105,7 +91,7 @@ pip install --force-reinstall (Get-ChildItem target/wheels/engine_rust-*.whl | S
   python examples/run_multi_asset_rebalance_strategy.py
   ```
 
-- 更多设计细节与补数流程，可参考 `doc/xtdata_market_data_plan.md`。
+- 更多设计细节与补数流程，可参考 `docs/xtdata_market_data_plan.md`。
 
 ## 代码用法
 

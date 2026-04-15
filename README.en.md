@@ -57,20 +57,7 @@ maturin develop --release
 
 Sample data: `examples/data/sample.csv` (headers: `datetime,open,high,low,close,volume`).
 
-## Market Data: DuckDB + QMT
 
-### DuckDB Local Store
-
-- The default database lives at `data/backtest.db`, but you can point scripts to any DuckDB file via `--db`.
-- Bulk-import historical data:
-
-  ```powershell
-  # Write CSV directly into DuckDB (requires the compiled engine_rust extension)
-  python examples/import_csv_to_db.py data/513500_d.csv --symbol 513500.SH --period 1d --db data/backtest.db
-  ```
-
-- Use `--no-direct-csv` to parse the CSV in Python first (useful for inspection) before saving through Rust.
-- Internally `save_klines` / `save_klines_from_csv` persist to the canonical schema; feel free to inspect the DB with `duckdb` CLI or any DuckDB-compatible tool.
 
 ### Zero-Maintenance QMT / XtData Backfill
 
@@ -85,7 +72,7 @@ Sample data: `examples/data/sample.csv` (headers: `datetime,open,high,low,close,
   python examples/run_multi_asset_rebalance_strategy.py
   ```
 
-- See `doc/xtdata_market_data_plan.md` for architecture details and operational recommendations.
+- See `docs/xtdata_market_data_plan.md` for architecture details and operational recommendations.
 
 ## In Code
 - Config & engine

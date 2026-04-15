@@ -17,37 +17,6 @@ from pyrust_bt.market_data import (  # type: ignore[attr-defined]
     MarketDataService,
 )
 
-
-
-class DummySMAStrategy(Strategy):
-    def __init__(self, window: int = 5, size: float = 1.0) -> None:
-        self.window = window
-        self.size = size
-        self._closes: List[float] = []
-
-    def next(self, bar: Dict[str, Any]) -> str | Dict[str, Any] | None:
-        close = float(bar["close"])  # type: ignore[assignment]
-        self._closes.append(close)
-        if len(self._closes) < self.window:
-            return None
-        sma = sum(self._closes[-self.window :]) / self.window
-        if close > sma:
-            # Market buy order
-            return {"action": "BUY", "type": "market", "size": self.size}
-        elif close < sma:
-            # Limit sell order (using current price as limit)
-            return {"action": "SELL", "type": "limit", "size": self.size, "price": close}
-        return None
-
-    def on_order(self, event: Dict[str, Any]) -> None:
-        # print("on_order:", event)
-        pass
-
-    def on_trade(self, event: Dict[str, Any]) -> None:
-        # print("on_trade:", event)
-        pass
-
-
 class MultiAssetRebalanceStrategy(Strategy):
     """
     简单的多资产等权策略：每个月首个交易日进行再平衡。
