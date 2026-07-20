@@ -63,15 +63,21 @@ class CashAwareStrategy(Strategy):
         return None
 ```
 
-Single-asset `ctx` exposes:
+Single-asset and multi-asset backtests share the same `EngineContext` type for `ctx`. It supports both attribute access (`ctx.cash`) and dict access (`ctx["cash"]`):
 
 | Field | Meaning |
 |---|---|
-| `position` | Current position |
-| `avg_cost` | Average cost |
+| `position` | Current position (multi-asset: primary feed symbol's position) |
+| `avg_cost` | Average cost (multi-asset: primary feed symbol's cost) |
 | `cash` | Current cash |
 | `equity` | Current equity |
-| `bar_index` | Zero-based bar index |
+| `bar_index` | Zero-based bar index / timeline step |
+| `positions` | Dict: symbol → `{"position", "avg_cost"}` |
+| `last_prices` | Dict: symbol → latest known price |
+
+The engine creates exactly one `ctx` instance per run and updates it in place on every bar / timeline step. If you keep a reference across callbacks, it always reads the latest snapshot.
+
+The `bar` object passed to `next()` is the original dict you supplied (including `symbol` and any custom fields) — do not mutate it.
 
 ## Action Format
 
@@ -170,15 +176,7 @@ class EqualWeightStrategy(Strategy):
         return actions
 ```
 
-Multi-asset `ctx` includes:
-
-| Field | Meaning |
-|---|---|
-| `positions` | Per-symbol position and average cost |
-| `cash` | Portfolio cash |
-| `equity` | Portfolio equity |
-| `bar_index` | Timeline step |
-| `last_prices` | Latest known price by symbol |
+Multi-asset `ctx` is the same `EngineContext` type described above. The portfolio-level fields (`cash`, `equity`) aggregate across symbols, `positions` / `last_prices` cover every symbol, and `update_slice` maps feed id to the original bar dict for that step.
 
 ## Matching Model
 

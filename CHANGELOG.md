@@ -1,6 +1,30 @@
 # Changelog / 更新日志
 
 ## [Unreleased]
+
+### 变更（第二阶段：结构重构 + 性能优化）
+
+行为变化：
+- 单/多资产策略上下文统一为 `EngineContext` 类型：属性访问（`ctx.cash`）与字典访问（`ctx["cash"]`）均可；多资产 `ctx` 不再是每步新建的 dict，新增 `positions` / `last_prices` 字段（单资产模式同样暴露，为该 symbol 的单项视图）。整个回测只创建一个 ctx 实例，引擎每 bar / 每时间步就地更新；跨回调持有引用读到的是最新快照。
+- bar 对象直通：策略 `next(bar, ...)` / `next_multi(update_slice, ...)` 收到的是用户传入的原始 bar dict（引擎不再重建副本），`symbol` 及自定义字段均可见；策略不应修改传入的 bar。
+- `BacktestConfig.batch_size` 废弃：字段保留仅为向后兼容，不再影响执行（无效的批处理外层循环已删除）。
+- `analyzers.factor_backtest`：删除 5000 行阈值与 Python 回退实现，统一走 Rust `factor_backtest_fast`。
+- `MultiFactorAnalyzer` 因子相关性矩阵改用 `self.df[...].corr()`：缺失值按成对（pairwise）相关处理，不再填 0。
+
+结构：
+- `rust/engine_rust/src/lib.rs`（约 2000 行）拆分为 `config` / `model` / `indicators` / `engine_single` / `engine_multi` / `accounting` / `stats` / `factor` 模块，lib.rs 仅保留 pymodule 注册；`run_multi` 结果构建复用统一的 `build_result`。
+
+性能：
+- 引擎每 bar 不再 `Py::new` 新建 ctx、不再重建 bar dict。
+- `pyrust_bt.indicators.SMA.update` 改为滚动求和 O(1)（原为每 bar `sum(deque)` O(window)）。
+
+清理：
+- Cargo.toml 删除未用依赖 rayon / serde / serde_json。
+- `parse_action_fast` 删除死参数 `_last_price`；`parse_actions_any` 删除未用的 `py` 与 `last_price_map` 参数。
+- database.rs 删除 stdout 进度打印（库不再向标准输出写日志）。
+- 注册此前定义但未暴露的 `load_and_synthesize_klines` 到 engine_rust 模块。
+
+### 规划
 - 引擎/撮合：部分成交、挂单簿、止损/止盈、OCO、条件单
 - 多资产结果：在回测结果中补充逐 symbol 的期末头寸与成本（`positions_by_symbol`）
 - 时间与日历：交易日历/时区，对齐策略（多周期、跨市场）

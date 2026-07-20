@@ -446,6 +446,167 @@ class EngineCoreTests(unittest.TestCase):
         self.assertEqual(stats["unfilled_orders"], 0)
         self.assertAlmostEqual(result["trades"][1]["realized_pnl"], 50.0)
 
+    def test_on_trade_exception_is_propagated(self):
+        class RaisingOnTradeStrategy(Strategy):
+            def __init__(self):
+                self.done = False
+
+            def next(self, bar, ctx):
+                if self.done:
+                    return None
+                self.done = True
+                return {"action": "BUY", "type": "market", "size": 1.0}
+
+            def on_trade(self, event):
+                raise ValueError("intentional on_trade failure")
+
+        with self.assertRaisesRegex(ValueError, "intentional on_trade failure"):
+            self.make_engine().run(RaisingOnTradeStrategy(), make_bars())
+
+    def test_missing_close_bar_raises_with_bar_index(self):
+        class NoopStrategy(Strategy):
+            def next(self, bar):
+                return None
+
+        bars = make_bars()
+        broken = dict(bars[1])
+        del broken["close"]
+        bars[1] = broken
+
+        with self.assertRaisesRegex(ValueError, r"bar\[1\].*close"):
+            self.make_engine().run(NoopStrategy(), bars)
+
+    def test_missing_datetime_bar_raises(self):
+        class NoopStrategy(Strategy):
+            def next(self, bar):
+                return None
+
+        bars = make_bars()
+        broken = dict(bars[0])
+        del broken["datetime"]
+        bars[0] = broken
+
+        with self.assertRaisesRegex(ValueError, r"bar\[0\].*datetime"):
+            self.make_engine().run(NoopStrategy(), bars)
+
+    def test_run_multi_feed_bar_missing_datetime_raises(self):
+        class NoopStrategy(Strategy):
+            def next_multi(self, update_slice, ctx):
+                return None
+
+        good = make_bars(symbol="AAA")
+        bad = make_bars(symbol="BBB")
+        broken = dict(bad[1])
+        del broken["datetime"]
+        bad[1] = broken
+
+        with self.assertRaisesRegex(ValueError, r"feed 'BBB'.*datetime"):
+            self.make_engine().run_multi(NoopStrategy(), {"AAA": good, "BBB": bad})
+
+    def test_run_multi_timeline_uses_chronological_not_string_order(self):
+        class NoopStrategy(Strategy):
+            def next_multi(self, update_slice, ctx):
+                return None
+
+        def bars_at(dt, symbol, close):
+            return [
+                {
+                    "datetime": dt,
+                    "open": close,
+                    "high": close,
+                    "low": close,
+                    "close": close,
+                    "volume": 1000.0,
+                    "symbol": symbol,
+                }
+            ]
+
+        # 非零填充小时：字符串比较会错误地把 "2024-01-01 10:00:00" 排在
+        # "2024-01-01 9:30:00" 之前（"1" < "9"），时间序比较则不会。
+        feeds = {
+            "AAA": bars_at("2024-01-01 9:30:00", "AAA", 10.0),
+            "BBB": bars_at("2024-01-01 10:00:00", "BBB", 20.0),
+        }
+        result = self.make_engine().run_multi(NoopStrategy(), feeds)
+        dts = [row["datetime"] for row in result["equity_curve"]]
+
+        self.assertEqual(dts, ["2024-01-01 9:30:00", "2024-01-01 10:00:00"])
+
+    def test_ctx_supports_dict_access_and_shared_instance(self):
+        class DictAccessStrategy(Strategy):
+            def __init__(self):
+                self.seen = []
+
+            def next(self, bar, ctx):
+                self.seen.append(
+                    (ctx["cash"], ctx.cash, ctx["bar_index"], ctx["positions"], ctx["last_prices"])
+                )
+                if ctx["bar_index"] == 0:
+                    return {"action": "BUY", "type": "market", "size": 1.0}
+                return None
+
+        strategy = DictAccessStrategy()
+        self.make_engine().run(strategy, make_bars())
+
+        # 字典访问与属性访问一致；单资产 ctx 也暴露 positions/last_prices
+        cash_dict, cash_attr, bar_index, positions, last_prices = strategy.seen[-1]
+        self.assertEqual(cash_dict, cash_attr)
+        self.assertEqual(bar_index, 1)
+        self.assertEqual(positions["TEST"]["position"], 1.0)
+        self.assertAlmostEqual(last_prices["TEST"], 12.0)
+
+    def test_ctx_setitem_roundtrip(self):
+        class MutatingStrategy(Strategy):
+            def next(self, bar, ctx):
+                ctx["cash"] = 123.0
+                assert ctx["cash"] == 123.0
+                assert ctx.cash == 123.0
+                return None
+
+        self.make_engine().run(MutatingStrategy(), make_bars())
+
+    def test_bar_passthrough_exposes_original_fields(self):
+        class BarInspectStrategy(Strategy):
+            def __init__(self):
+                self.symbols = []
+                self.custom = []
+
+            def next(self, bar):
+                # 直通原始 bar：symbol 与自定义字段都可见
+                self.symbols.append(bar["symbol"])
+                self.custom.append(bar["custom_field"])
+                return None
+
+        bars = make_bars()
+        for i, b in enumerate(bars):
+            b["custom_field"] = f"cf{i}"
+        strategy = BarInspectStrategy()
+        self.make_engine().run(strategy, bars)
+
+        self.assertEqual(strategy.symbols, ["TEST", "TEST"])
+        self.assertEqual(strategy.custom, ["cf0", "cf1"])
+
+    def test_multi_ctx_is_engine_context_with_dict_access(self):
+        class CtxInspectStrategy(Strategy):
+            def __init__(self):
+                self.ctx_type = None
+                self.equity = None
+                self.last_prices = None
+
+            def next_multi(self, update_slice, ctx):
+                self.ctx_type = type(ctx).__name__
+                self.equity = ctx["equity"]
+                self.last_prices = dict(ctx["last_prices"])
+                return None
+
+        strategy = CtxInspectStrategy()
+        feeds = {"AAA": make_bars(symbol="AAA"), "BBB": make_bars(symbol="BBB")}
+        self.make_engine().run_multi(strategy, feeds)
+
+        self.assertEqual(strategy.ctx_type, "EngineContext")
+        self.assertEqual(strategy.equity, 1000.0)
+        self.assertEqual(set(strategy.last_prices), {"AAA", "BBB"})
+
     def test_multi_asset_disallow_short_rejects_symbol_order(self):
         class MultiSellStrategy(Strategy):
             def next_multi(self, update_slice, ctx):

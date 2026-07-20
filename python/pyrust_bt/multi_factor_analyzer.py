@@ -588,21 +588,16 @@ class MultiFactorAnalyzer:
         return rankings
     
     def _calculate_correlation_matrix(self) -> pd.DataFrame:
-        """计算因子间相关性矩阵"""
+        """计算因子间相关性矩阵（pandas 成对相关，缺失值不填 0）"""
         if not self.factor_names:
             return pd.DataFrame()
         
-        # 构建因子值矩阵
-        factor_data = {}
-        for factor_name in self.factor_names:
-            factor_values = []
-            for bar in self.bars:
-                val = bar.get(factor_name)
-                factor_values.append(float(val) if val is not None else 0.0)
-            factor_data[factor_name] = factor_values
-        
-        # 计算相关性矩阵
-        df = pd.DataFrame(factor_data)
+        # 直接复用 self.df，避免逐 bar 重建 list；None 经 coerce 变 NaN，
+        # corr() 自动做成对（pairwise）处理
+        cols = [c for c in self.factor_names if c in self.df.columns]
+        if not cols:
+            return pd.DataFrame()
+        df = self.df[cols].apply(pd.to_numeric, errors="coerce")
         return df.corr()
     
     def _generate_summary_stats(self, factor_results: Dict[str, FactorResult]) -> Dict[str, Any]:

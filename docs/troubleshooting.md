@@ -126,8 +126,7 @@ http://127.0.0.1:8000/runs
 Try:
 
 - Use `maturin develop --release`, not a debug build.
-- Increase `batch_size` to `1000` or `5000`.
-- Avoid printing from `next()` on every bar.
+- Avoid printing from `next()` on every bar. (`batch_size` is deprecated and no longer affects execution.)
 - Keep expensive pandas operations outside the strategy loop.
 - Use Rust vectorized indicators for large arrays.
 

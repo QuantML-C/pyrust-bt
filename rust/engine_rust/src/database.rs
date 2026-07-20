@@ -6,6 +6,15 @@ use duckdb::Connection;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// 临时表名并发去重计数器（同进程内多次/多线程 save_klines 不再撞名）
+static TEMP_TABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn unique_temp_table_name(prefix: &str) -> String {
+    let seq = TEMP_TABLE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}_{}_{}", prefix, std::process::id(), seq)
+}
 
 // K-line bar structure for internal processing
 #[derive(Clone, Debug)]
@@ -19,36 +28,38 @@ pub struct KlineBar {
     pub symbol: String,
 }
 
-// Convert period string to minutes
+// Convert period string to minutes (case-sensitive):
+// "1m" = 1 minute, "1M"/"1mo" = 1 month, "1h"/"1d"/"1w"/"1y" as usual.
 fn period_to_minutes(period: &str) -> Option<i64> {
-    let period_lower = period.to_lowercase();
-
-    if period_lower.ends_with('m') {
-        period_lower[..period_lower.len() - 1].parse::<i64>().ok()
-    } else if period_lower.ends_with('h') {
-        period_lower[..period_lower.len() - 1]
+    if period.ends_with("mo") {
+        period[..period.len() - 2]
+            .parse::<i64>()
+            .ok()
+            .map(|m| m * 43200)
+    } else if period.ends_with('M') {
+        period[..period.len() - 1]
+            .parse::<i64>()
+            .ok()
+            .map(|m| m * 43200)
+    } else if period.ends_with('m') {
+        period[..period.len() - 1].parse::<i64>().ok()
+    } else if period.ends_with('h') {
+        period[..period.len() - 1]
             .parse::<i64>()
             .ok()
             .map(|h| h * 60)
-    } else if period_lower.ends_with('d') {
-        period_lower[..period_lower.len() - 1]
+    } else if period.ends_with('d') {
+        period[..period.len() - 1]
             .parse::<i64>()
             .ok()
             .map(|d| d * 1440)
-    } else if period_lower.ends_with('w') {
-        period_lower[..period_lower.len() - 1]
+    } else if period.ends_with('w') {
+        period[..period.len() - 1]
             .parse::<i64>()
             .ok()
             .map(|w| w * 10080)
-    } else if period_lower.ends_with("mo") || period_lower.ends_with('M') {
-        let num_str = if period_lower.ends_with("mo") {
-            &period_lower[..period_lower.len() - 2]
-        } else {
-            &period_lower[..period_lower.len() - 1]
-        };
-        num_str.parse::<i64>().ok().map(|m| m * 43200)
-    } else if period_lower.ends_with('y') {
-        period_lower[..period_lower.len() - 1]
+    } else if period.ends_with('y') {
+        period[..period.len() - 1]
             .parse::<i64>()
             .ok()
             .map(|y| y * 525600)
@@ -58,8 +69,15 @@ fn period_to_minutes(period: &str) -> Option<i64> {
 }
 
 fn sanitize_period_identifier(period: &str) -> PyResult<String> {
-    let mut sanitized = String::with_capacity(period.len());
-    for ch in period.chars() {
+    // 大小写敏感映射：月线 "1M" 规范化为 "1mo"（表名 klines_1mo），
+    // 分钟线 "1m" 保持 "1m"（表名 klines_1m），其余（"1d"/"1w" 等）不变。
+    let normalized = if period.ends_with('M') && !period.ends_with("mo") {
+        format!("{}mo", &period[..period.len() - 1])
+    } else {
+        period.to_string()
+    };
+    let mut sanitized = String::with_capacity(normalized.len());
+    for ch in normalized.chars() {
         if ch.is_ascii_alphanumeric() {
             sanitized.push(ch.to_ascii_lowercase());
         } else {
@@ -163,9 +181,11 @@ fn round_down_to_period(dt: NaiveDateTime, minutes: i64) -> NaiveDateTime {
 }
 
 // Aggregate bars into one bar (OHLCV)
-fn aggregate_bars(bars: &[KlineBar], group_time: &NaiveDateTime) -> KlineBar {
+fn aggregate_bars(bars: &[KlineBar], group_time: &NaiveDateTime) -> PyResult<KlineBar> {
     if bars.is_empty() {
-        panic!("Cannot aggregate empty bar list");
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "Cannot aggregate empty bar list",
+        ));
     }
 
     let open = bars[0].open;
@@ -179,7 +199,7 @@ fn aggregate_bars(bars: &[KlineBar], group_time: &NaiveDateTime) -> KlineBar {
     let symbol = bars[0].symbol.clone();
     let datetime = group_time.format("%Y-%m-%d %H:%M:%S").to_string();
 
-    KlineBar {
+    Ok(KlineBar {
         datetime,
         open,
         high,
@@ -187,7 +207,7 @@ fn aggregate_bars(bars: &[KlineBar], group_time: &NaiveDateTime) -> KlineBar {
         close,
         volume,
         symbol,
-    }
+    })
 }
 
 // Resample K-line data to target period
@@ -226,7 +246,7 @@ pub fn resample_klines_rust(bars: Vec<KlineBar>, target_period: &str) -> PyResul
                 if group_time != ct {
                     // Finalize previous group
                     if !current_group.is_empty() {
-                        resampled.push(aggregate_bars(&current_group, &ct));
+                        resampled.push(aggregate_bars(&current_group, &ct)?);
                     }
                     // Start new group
                     current_group = vec![bar];
@@ -242,7 +262,7 @@ pub fn resample_klines_rust(bars: Vec<KlineBar>, target_period: &str) -> PyResul
     // Finalize last group
     if !current_group.is_empty() {
         if let Some(ct) = current_group_time {
-            resampled.push(aggregate_bars(&current_group, &ct));
+            resampled.push(aggregate_bars(&current_group, &ct)?);
         }
     }
 
@@ -601,8 +621,34 @@ pub fn save_klines(
     // Ultra-fast batch insert using temporary table
     // Strategy: Create temp table -> Bulk insert -> Insert into target table -> Drop temp table
     // This is much faster than individual batch inserts
-    let temp_table = format!("temp_klines_{}", std::process::id());
-    
+    let temp_table = unique_temp_table_name("temp_klines");
+
+    // 事务内任何失败路径：先 ROLLBACK（并尽力清理临时表）再返回 Err
+    if let Err(e) = save_klines_in_transaction(&conn, &table_name, &temp_table, &kline_bars) {
+        let _ = conn.execute("ROLLBACK", []);
+        let _ = conn.execute(&format!("DROP TABLE IF EXISTS {}", temp_table), []);
+        return Err(e);
+    }
+
+    // Commit transaction (all inserts happen atomically)
+    conn.execute("COMMIT", []).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "Failed to commit transaction: {}",
+            e
+        ))
+    })?;
+
+    Ok(())
+}
+
+/// 事务体：临时表批量写入 + 合并进目标表。任何步骤失败都返回 Err，
+/// 由调用方负责 ROLLBACK。
+fn save_klines_in_transaction(
+    conn: &Connection,
+    table_name: &str,
+    temp_table: &str,
+    kline_bars: &[KlineBar],
+) -> PyResult<()> {
     // Create temporary table with same structure
     conn.execute(
         &format!(
@@ -670,17 +716,10 @@ pub fn save_klines(
                 batch_start, e
             ))
         })?;
-        
-        // Print progress every 50k records or at end
-        if batch_end % 50000 == 0 || batch_end == total {
-            println!("  Progress: {}/{} records prepared ({:.1}%)", 
-                batch_end, total, (batch_end as f64 / total as f64) * 100.0);
-        }
     }
 
     // Now insert from temp table to target table in one operation
     // This is much faster than individual inserts with conflict checking
-    println!("  Inserting data into target table...");
     conn.execute(
         &format!(
             "INSERT INTO {} (symbol, datetime, open, high, low, close, volume)
@@ -701,14 +740,6 @@ pub fn save_klines(
     conn.execute(&format!("DROP TABLE {}", temp_table), []).map_err(|e| {
         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
             "Failed to drop temporary table: {}",
-            e
-        ))
-    })?;
-
-    // Commit transaction (all inserts happen atomically)
-    conn.execute("COMMIT", []).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Failed to commit transaction: {}",
             e
         ))
     })?;
@@ -763,7 +794,17 @@ pub fn save_klines_from_csv(
     })?;
 
     // Create temporary table and load CSV directly
-    let temp_table = format!("temp_csv_import_{}", std::process::id());
+    let temp_table = unique_temp_table_name("temp_csv_import");
+
+    // 事务内任何失败路径：先 ROLLBACK（并尽力清理临时表）再返回 Err
+    macro_rules! txn_fail {
+        ($e:expr) => {{
+            let err = $e;
+            let _ = conn.execute("ROLLBACK", []);
+            let _ = conn.execute(&format!("DROP TABLE IF EXISTS {}", temp_table), []);
+            return Err(err);
+        }};
+    }
     
     // DuckDB can read CSV directly and infer schema
     // Expected CSV format: datetime,open,high,low,close,volume
@@ -785,17 +826,15 @@ pub fn save_klines_from_csv(
         temp_table, symbol_escaped, csv_path_escaped
     );
 
-    println!("  Reading CSV file directly with DuckDB...");
-    conn.execute(&create_temp_sql, []).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+    if let Err(e) = conn.execute(&create_temp_sql, []) {
+        txn_fail!(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
             "Failed to read CSV file: {}. Make sure CSV has headers: datetime,open,high,low,close,volume",
             e
-        ))
-    })?;
+        )));
+    }
 
     // Insert from temp table to target table
-    println!("  Inserting data into target table...");
-    conn.execute(
+    if let Err(e) = conn.execute(
         &format!(
             "INSERT INTO {} (symbol, datetime, open, high, low, close, volume)
              SELECT symbol, datetime, open, high, low, close, volume
@@ -803,13 +842,13 @@ pub fn save_klines_from_csv(
              ON CONFLICT (symbol, datetime) DO NOTHING",
             table_name, temp_table
         ),
-        []
-    ).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+        [],
+    ) {
+        txn_fail!(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
             "Failed to insert from temp table: {}",
             e
-        ))
-    })?;
+        )));
+    }
 
     // Drop temporary table
     conn.execute(&format!("DROP TABLE {}", temp_table), []).ok();

@@ -30,5 +30,12 @@ def grid_search(
         stats = res.get("stats", {}) or {}
         results.append((params, {**res, "score": stats.get(score_key)}))
 
-    results.sort(key=lambda x: (x[1].get("score") is None, -(x[1].get("score") or float("-inf"))))
+    def _sort_key(x: Tuple[Dict[str, Any], Dict[str, Any]]) -> Tuple[bool, float]:
+        score = x[1].get("score")
+        # 显式 None 判断：score=0.0 是有效分数，不能当 -inf 处理
+        if score is None:
+            return (True, 0.0)
+        return (False, -float(score))
+
+    results.sort(key=_sort_key)
     return results 

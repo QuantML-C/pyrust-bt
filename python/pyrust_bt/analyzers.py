@@ -104,71 +104,72 @@ def round_trips_from_trades(
     trades: List[Dict[str, Any]],
     bars: Optional[List[Dict[str, Any]]] = None,
 ) -> List[RoundTrip]:
-    rts: List[RoundTrip] = []
-    inv_side: Optional[str] = None
-    inv_price: float = 0.0
-    inv_size: float = 0.0
-    inv_idx: int = 0
+    """从成交流水配对 round trip。
 
+    - 按 symbol 分组（无 symbol 的归入同一组），各组独立配对；
+    - 同方向加仓入队，反向成交按 FIFO 与最早未平仓位配对；
+    - 支持部分平仓：closing = min(持仓余量, 反向数量)，余量保留继续配对；
+      反向数量超出持仓时，超出部分反方向开仓；
+    - entry/exit datetime 直接取 trade 记录自带的 datetime 字段，
+      不再用 trades 下标索引 bars（下标语义错位）。
+    """
+    del bars  # 兼容旧签名；datetime 现取自 trade 记录本身
+
+    rts: List[RoundTrip] = []
+
+    # 按 symbol 分组（保持首次出现顺序），无 symbol 的归一组
+    groups: Dict[str, List[Tuple[int, Dict[str, Any]]]] = {}
     for i, t in enumerate(trades):
-        side = str(t.get("side", "")).upper()
-        price = float(t.get("price", 0.0))
-        size = float(t.get("size", 0.0))
-        
-        if inv_side is None:
-            inv_side = "LONG" if side == "BUY" else "SHORT"
-            inv_price = price
-            inv_size = size
-            inv_idx = i
-        else:
-            if inv_side == "LONG" and side == "SELL":
-                closing = min(inv_size, size)
-                pnl = (price - inv_price) * closing
-                ret = (price / inv_price - 1.0)
-                
-                entry_dt = bars[inv_idx].get("datetime") if bars and inv_idx < len(bars) else None
-                exit_dt = bars[i].get("datetime") if bars and i < len(bars) else None
-                
+        sym = t.get("symbol")
+        key = str(sym) if sym is not None else "__default__"
+        groups.setdefault(key, []).append((i, t))
+
+    for group in groups.values():
+        # FIFO 未平仓队列：每个元素 [side, price, remaining_size, trade_idx, datetime]
+        open_lots: List[List[Any]] = []
+        for i, t in group:
+            side = str(t.get("side", "")).upper()
+            price = float(t.get("price", 0.0))
+            remaining = float(t.get("size", 0.0))
+            dt = t.get("datetime")
+
+            # 反向成交：FIFO 平仓（支持部分平仓，余量保留）
+            while remaining > 0 and open_lots and open_lots[0][0] != side:
+                lot = open_lots[0]
+                closing = min(lot[2], remaining)
+                lot_side, lot_price, _, lot_idx, lot_dt = lot
+                if lot_side == "BUY":  # 多头仓位被 SELL 平掉
+                    pnl = (price - lot_price) * closing
+                    ret = (price / lot_price - 1.0) if lot_price else 0.0
+                    rt_side = "LONG"
+                else:  # 空头仓位被 BUY 平掉
+                    pnl = (lot_price - price) * closing
+                    ret = (lot_price / price - 1.0) if price else 0.0
+                    rt_side = "SHORT"
                 rts.append(
                     RoundTrip(
-                        entry_idx=inv_idx,
+                        entry_idx=lot_idx,
                         exit_idx=i,
-                        side="LONG",
-                        entry_price=inv_price,
+                        side=rt_side,
+                        entry_price=lot_price,
                         exit_price=price,
                         size=closing,
                         pnl=pnl,
                         return_ratio=ret,
-                        holding_bars=(i - inv_idx),
-                        entry_datetime=entry_dt,
-                        exit_datetime=exit_dt,
+                        holding_bars=(i - lot_idx),
+                        entry_datetime=lot_dt,
+                        exit_datetime=dt,
                     )
                 )
-                inv_side = None
-            elif inv_side == "SHORT" and side == "BUY":
-                closing = min(inv_size, size)
-                pnl = (inv_price - price) * closing
-                ret = (inv_price / price - 1.0)
-                
-                entry_dt = bars[inv_idx].get("datetime") if bars and inv_idx < len(bars) else None
-                exit_dt = bars[i].get("datetime") if bars and i < len(bars) else None
-                
-                rts.append(
-                    RoundTrip(
-                        entry_idx=inv_idx,
-                        exit_idx=i,
-                        side="SHORT",
-                        entry_price=inv_price,
-                        exit_price=price,
-                        size=closing,
-                        pnl=pnl,
-                        return_ratio=ret,
-                        holding_bars=(i - inv_idx),
-                        entry_datetime=entry_dt,
-                        exit_datetime=exit_dt,
-                    )
-                )
-                inv_side = None
+                lot[2] -= closing
+                remaining -= closing
+                if lot[2] <= 0:
+                    open_lots.pop(0)
+
+            # 余量（含同方向加仓、或平仓后反向超出部分）作为新仓位入队
+            if remaining > 0:
+                open_lots.append([side, price, remaining, i, dt])
+
     return rts
 
 
@@ -298,91 +299,23 @@ def factor_backtest(
     quantiles: int = 5,
     forward: int = 1,
 ) -> Dict[str, Any]:
-    """增强的因子回测分析（自动走 Rust 快速路径）。"""
+    """增强的因子回测分析（统一走 Rust 快速路径 factor_backtest_fast）。"""
     n = len(bars)
     if n <= forward or quantiles < 2:
         return {"quantiles": [], "mean_returns": [], "ic": None}
 
-    # 当数据量较大且 Rust 加速可用时，走快速路径
-    if _factor_backtest_fast is not None and n > 5000:
-        closes: List[float] = []
-        factors: List[float] = []
-        for i in range(n):
-            closes.append(float(bars[i]["close"]))  # type: ignore[assignment]
-            v = bars[i].get(factor_key)
-            factors.append(float(v) if v is not None else 0.0)
-        return _factor_backtest_fast(closes, factors, quantiles, forward)  # type: ignore[no-any-return]
+    if _factor_backtest_fast is None:  # pragma: no cover
+        raise RuntimeError(
+            "engine_rust extension is not built; factor_backtest requires factor_backtest_fast"
+        )
 
-    # Python 回退实现（小数据或无 Rust 快速路径）
-    # 计算前向收益
-    fwd_returns: List[float] = []
-    for i in range(n - forward):
-        c0 = float(bars[i]["close"])  # type: ignore[assignment]
-        c1 = float(bars[i + forward]["close"])  # type: ignore[assignment]
-        fwd_returns.append((c1 / c0) - 1.0 if c0 != 0 else 0.0)
-
-    # 收集因子值
-    factor_values: List[float] = []
-    for i in range(n - forward):
+    closes: List[float] = []
+    factors: List[float] = []
+    for i in range(n):
+        closes.append(float(bars[i]["close"]))  # type: ignore[assignment]
         v = bars[i].get(factor_key)
-        factor_values.append(float(v) if v is not None else 0.0)
-
-    if not factor_values or not fwd_returns:
-        return {"quantiles": [], "mean_returns": [], "ic": None}
-
-    # 分位数分组
-    sorted_factors = sorted(factor_values)
-    q_bounds = []
-    for q in range(1, quantiles):
-        idx = int(len(sorted_factors) * q / quantiles)
-        q_bounds.append(sorted_factors[idx])
-
-    # 分组统计
-    groups: List[List[float]] = [[] for _ in range(quantiles)]
-    for fac_val, ret in zip(factor_values, fwd_returns):
-        group_idx = 0
-        for bound in q_bounds:
-            if fac_val > bound:
-                group_idx += 1
-            else:
-                break
-        groups[group_idx].append(ret)
-
-    mean_returns = [sum(g) / len(g) if g else 0.0 for g in groups]
-
-    # IC计算（皮尔逊相关）
-    if len(factor_values) == len(fwd_returns) and len(factor_values) > 1:
-        mean_fac = sum(factor_values) / len(factor_values)
-        mean_ret = sum(fwd_returns) / len(fwd_returns)
-
-        cov = sum((f - mean_fac) * (r - mean_ret) for f, r in zip(factor_values, fwd_returns))
-        var_fac = sum((f - mean_fac) ** 2 for f in factor_values)
-        var_ret = sum((r - mean_ret) ** 2 for r in fwd_returns)
-
-        ic = cov / (math.sqrt(var_fac * var_ret) + 1e-12)
-    else:
-        ic = 0.0
-
-    # 计算分组间的单调性
-    monotonicity = 0.0
-    if len(mean_returns) > 1:
-        increasing = sum(1 for i in range(1, len(mean_returns)) if mean_returns[i] > mean_returns[i-1])
-        decreasing = sum(1 for i in range(1, len(mean_returns)) if mean_returns[i] < mean_returns[i-1])
-        monotonicity = (increasing - decreasing) / (len(mean_returns) - 1)
-
-    return {
-        "quantiles": list(range(1, quantiles + 1)),
-        "mean_returns": mean_returns,
-        "ic": ic,
-        "monotonicity": monotonicity,
-        "q_bounds": q_bounds,
-        "factor_stats": {
-            "mean": sum(factor_values) / len(factor_values) if factor_values else 0.0,
-            "std": math.sqrt(sum((f - sum(factor_values) / len(factor_values)) ** 2 for f in factor_values) / len(factor_values)) if len(factor_values) > 1 else 0.0,
-            "min": min(factor_values) if factor_values else 0.0,
-            "max": max(factor_values) if factor_values else 0.0,
-        }
-    }
+        factors.append(float(v) if v is not None else 0.0)
+    return _factor_backtest_fast(closes, factors, quantiles, forward)  # type: ignore[no-any-return]
 
 
 def generate_analysis_report(

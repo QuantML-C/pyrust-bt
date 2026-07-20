@@ -80,3 +80,5 @@ examples/results/*
 
 doc/*md
 *.db
+# local MSVC build helper (machine-specific)
+cargo-msvc.cmd

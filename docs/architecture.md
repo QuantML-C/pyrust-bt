@@ -31,7 +31,8 @@ flowchart LR
 | `python/pyrust_bt/analyzers.py` | Drawdowns, round trips, metrics, factor backtest |
 | `python/pyrust_bt/optimize.py` | Grid search |
 | `python/pyrust_bt/market_data/service.py` | DB-first market data service with optional xtdata fallback |
-| `rust/engine_rust/src/lib.rs` | Backtest engine, indicators, factor fast path |
+| `rust/engine_rust/src/lib.rs` | PyO3 module registration only |
+| `rust/engine_rust/src/{config,model,indicators,engine_single,engine_multi,accounting,stats,factor}.rs` | Backtest engine modules (config, data model, indicators, single/multi-asset loops, accounting, stats, factor fast path) |
 | `rust/engine_rust/src/database.rs` | DuckDB K-line storage and query functions |
 | `python/server_main.py` | FastAPI run service |
 | `frontend/streamlit_app.py` | Streamlit UI |
@@ -79,7 +80,7 @@ The Rust engine:
 1. Extracts all feed bars.
 2. Builds a combined timeline from bar datetimes.
 3. Updates the latest bar snapshot for each feed.
-4. Builds a portfolio context with cash, equity, positions, and last prices.
+4. Updates the shared `EngineContext` (cash, equity, positions, last prices) in place.
 5. Calls `strategy.next_multi(update_slice, ctx)`.
 6. Parses one action or a list of actions.
 7. Updates per-symbol positions and portfolio cash.
@@ -114,11 +115,14 @@ The engine reduces Python overhead by:
 
 - Extracting bar data before the loop.
 - Preallocating result buffers.
-- Processing bars in configurable batches.
+- Reusing a single `EngineContext` instance per run, updated in place each bar.
+- Passing the original bar objects straight through to the strategy instead of rebuilding per-bar dicts.
 - Keeping position updates in Rust.
 - Exposing vectorized indicators from Rust.
 
 The strategy is still called from Python at every bar. That is intentional: users keep Python strategy flexibility, while the bookkeeping and matching path stays in Rust.
+
+Note: because bar objects are passed through without copying, strategies must treat them as read-only. Mutating a bar mutates the user's original data and is unsupported.
 
 ## Known Boundaries
 
